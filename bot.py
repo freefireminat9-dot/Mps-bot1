@@ -35,7 +35,7 @@ load_dotenv()
 # ============================================================
 #  CONFIGURAÇÕES — edite conforme a sua liga
 # ============================================================
-GUILD_ID = 1533081915152666624
+GUILD_ID = 1540722239027023882
 GUILD = discord.Object(id=GUILD_ID)
 
 # ID da categoria onde os canais de ticket serão criados (opcional).
