@@ -5,12 +5,19 @@ Slash: /
 
 Recursos:
   - Tickets automáticos (select menu de categorias, claim, fechar com motivo, transcript)
+  - Assistente automático (IA) responde no ticket até a staff assumir
   - Drop estilo PAFO (select menu + cargos temporários 5 dias) com banco de 1000+ perguntas diversas
-  - Meta de membros → Wave Drop
+  - Meta de membros → Wave Drop (inicia sozinha ao bater a meta)
   - Free Agent / Scouting
   - /role (sem ID de cargo no código)
   - /say e /say_embed (foto do bot automática, sempre)
   - Painel de configuração organizado (estilo PAFO)
+
+Dependências opcionais:
+  - Para o assistente de ticket responder com IA de verdade (Claude),
+    instale `pip install anthropic` e defina a variável de ambiente
+    ANTHROPIC_API_KEY. Sem isso, o assistente usa respostas prontas
+    por categoria — o ticket nunca fica sem resposta automática.
 """
 
 import os
@@ -275,7 +282,7 @@ DEFAULT_CONFIG = {
 
 def carregar_dados() -> dict:
     if not os.path.exists(DATA_PATH):
-        return {"config": copy.deepcopy(DEFAULT_CONFIG), "freeagents": {}, "scoutings": {}, "drop_expiracoes": {}}
+        return {"config": copy.deepcopy(DEFAULT_CONFIG), "freeagents": {}, "scoutings": {}, "drop_expiracoes": {}, "tickets": {}}
     with open(DATA_PATH, "r", encoding="utf-8") as f:
         dados = json.load(f)
     dados.setdefault("config", copy.deepcopy(DEFAULT_CONFIG))
@@ -291,6 +298,7 @@ def carregar_dados() -> dict:
     dados.setdefault("freeagents", {})
     dados.setdefault("scoutings", {})
     dados.setdefault("drop_expiracoes", {})
+    dados.setdefault("tickets", {})  # estado de cada ticket: reivindicado, tipo, autor
     return dados
 
 
@@ -333,6 +341,96 @@ def bot_avatar_url() -> Optional[str]:
     if bot.user:
         return bot.user.display_avatar.url
     return None
+
+
+# ============================================================
+#  ASSISTENTE AUTOMÁTICO DO TICKET (estilo "Assistente PAFO (IA)")
+#  Responde a quem abriu o ticket automaticamente até que um
+#  membro da staff clique em "Assumir". Se a variável de ambiente
+#  ANTHROPIC_API_KEY estiver configurada e o pacote `anthropic`
+#  instalado, as respostas usam IA de verdade (Claude). Caso
+#  contrário, cai em respostas prontas por categoria — o sistema
+#  nunca fica sem responder.
+# ============================================================
+try:
+    import anthropic
+    _anthropic_client = anthropic.Anthropic() if os.getenv("ANTHROPIC_API_KEY") else None
+except Exception:
+    anthropic = None
+    _anthropic_client = None
+
+RESPOSTAS_PADRAO_POR_TIPO = {
+    "suporte": "Recebi sua mensagem! Já anotei sua solicitação de suporte. Um membro da staff vai assumir o ticket assim que possível.",
+    "denuncia": "Entendido. Se tiver provas (prints, vídeos ou links), envie aqui mesmo no ticket. A staff vai analisar sua denúncia em breve.",
+    "duvidas": "Boa pergunta! Vou registrar aqui para a staff, que pode te dar uma resposta oficial assim que assumir o ticket.",
+    "parcerias": "Obrigado pelo interesse em fazer parceria com a BRS! Alguém da equipe de negócios vai te responder em breve.",
+}
+
+# Controle simples de cooldown para não floodar respostas automáticas.
+_ULTIMA_RESPOSTA_IA: dict[int, datetime.datetime] = {}
+COOLDOWN_IA_SEGUNDOS = 8
+
+
+async def gerar_resposta_ia(pergunta: str, tipo_ticket: str) -> Optional[str]:
+    """Tenta gerar uma resposta real com IA (Claude). Retorna None se a
+    integração não estiver configurada ou der erro — quem chamar deve
+    usar a resposta padrão da categoria nesse caso."""
+    if not _anthropic_client:
+        return None
+    tipo = TICKET_CATEGORIES_BY_KEY.get(tipo_ticket, {"label": "Atendimento"})
+
+    def _chamar():
+        resposta = _anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=250,
+            system=(
+                "Você é o assistente automático de tickets da BRS (Brazilian Roblox "
+                "Soccer), uma comunidade de Discord sobre um jogo de futebol no "
+                f"Roblox. O ticket atual é da categoria '{tipo['label']}'. "
+                "Responda de forma curta (no máximo 3 frases), simpática e em "
+                "português do Brasil, ajudando com o que for possível. Deixe "
+                "claro que você é um assistente automático e que um membro da "
+                "staff de verdade vai assumir o atendimento em breve. Nunca "
+                "prometa recompensas, cargos ou ações que só a staff pode fazer."
+            ),
+            messages=[{"role": "user", "content": pergunta[:1500]}],
+        )
+        blocos = [b.text for b in resposta.content if getattr(b, "type", None) == "text"]
+        return "\n".join(blocos).strip()
+
+    try:
+        loop = asyncio.get_event_loop()
+        texto = await loop.run_in_executor(None, _chamar)
+        return texto or None
+    except Exception:
+        log.exception("Erro ao chamar a IA do assistente de tickets")
+        return None
+
+
+async def assistente_responder_ticket(message: discord.Message, ticket_info: dict):
+    """Faz o assistente automático responder a uma mensagem dentro de um
+    ticket ainda não reivindicado por ninguém da staff."""
+    agora = datetime.datetime.utcnow()
+    ultima = _ULTIMA_RESPOSTA_IA.get(message.channel.id)
+    if ultima and (agora - ultima).total_seconds() < COOLDOWN_IA_SEGUNDOS:
+        return
+    _ULTIMA_RESPOSTA_IA[message.channel.id] = agora
+
+    tipo_key = ticket_info.get("tipo", "suporte")
+    async with message.channel.typing():
+        texto_ia = await gerar_resposta_ia(message.content, tipo_key)
+        texto = texto_ia or RESPOSTAS_PADRAO_POR_TIPO.get(tipo_key, RESPOSTAS_PADRAO_POR_TIPO["suporte"])
+
+    embed = discord.Embed(
+        title="🤖 Assistente BRS (IA)",
+        description=f"Oi {message.author.mention}! {texto}",
+        color=BRS_GREEN,
+    )
+    avatar = bot_avatar_url()
+    if avatar:
+        embed.set_thumbnail(url=avatar)
+    embed.set_footer(text="✦ Atendimento automático · Um membro da staff chegará em breve.")
+    await message.channel.send(embed=embed)
 
 
 # ============================================================
@@ -414,6 +512,18 @@ async def on_message(message: discord.Message):
 
             ACTIVE_DROP = None
             return
+
+    # === ASSISTENTE AUTOMÁTICO DE TICKET ===
+    # Enquanto ninguém da staff "assumir" o ticket, o bot responde
+    # automaticamente para quem abriu o atendimento.
+    if is_ticket_channel(message.channel):
+        ticket_info = DADOS["tickets"].get(str(message.channel.id))
+        if (
+            ticket_info
+            and not ticket_info.get("reivindicado")
+            and message.author.id == ticket_info.get("autor_id")
+        ):
+            asyncio.create_task(assistente_responder_ticket(message, ticket_info))
 
     await bot.process_commands(message)
 
@@ -542,6 +652,31 @@ class TicketTypeSelect(discord.ui.Select):
 
         await ticket_channel.send(content=conteudo, embed=embed, view=TicketControlView())
 
+        # Guarda o estado do ticket (autor, tipo e se já foi reivindicado)
+        # para o assistente automático e para os botões de controle usarem.
+        DADOS["tickets"][str(ticket_channel.id)] = {
+            "autor_id": interaction.user.id,
+            "tipo": tipo_key,
+            "reivindicado": False,
+            "reivindicado_por": None,
+        }
+        salvar_dados(DADOS)
+
+        # Mensagem do assistente automático, avisando que vai ajudar
+        # enquanto a staff não chega — igual ao "Assistente (IA)" de referência.
+        assistente_embed = discord.Embed(
+            title="🤖 Assistente BRS (IA)",
+            description=(
+                f"Oi {interaction.user.mention}! Pode perguntar, tô aqui pra ajudar "
+                "enquanto a staff não chega."
+            ),
+            color=BRS_GREEN,
+        )
+        if avatar:
+            assistente_embed.set_thumbnail(url=avatar)
+        assistente_embed.set_footer(text="✦ Atendimento automático · Um membro da staff chegará em breve.")
+        await ticket_channel.send(embed=assistente_embed)
+
         log_id = cfg.get("log_channel_id")
         if log_id and (log_channel := guild.get_channel(log_id)):
             await log_channel.send(embed=discord.Embed(
@@ -570,10 +705,33 @@ class TicketControlView(discord.ui.View):
         if not tem_permissao(interaction.user, "ticket"):
             await interaction.response.send_message("❌ Apenas a staff pode assumir tickets.", ephemeral=True)
             return
+
+        # Desliga o assistente automático — a partir daqui é a staff que atende.
+        ticket_info = DADOS["tickets"].get(str(interaction.channel.id))
+        autor_mention = None
+        if ticket_info:
+            ticket_info["reivindicado"] = True
+            ticket_info["reivindicado_por"] = interaction.user.id
+            salvar_dados(DADOS)
+            if (guild := interaction.guild) and (autor := guild.get_member(ticket_info.get("autor_id"))):
+                autor_mention = autor.mention
+        _ULTIMA_RESPOSTA_IA.pop(interaction.channel.id, None)
+
         button.label = f"Assumido por {interaction.user.display_name}"
         button.disabled = True
         await interaction.response.edit_message(view=self)
-        await interaction.channel.send(f"🙋 {interaction.user.mention} assumiu este ticket.")
+
+        embed = discord.Embed(
+            title="🤝 Atendimento Iniciado",
+            description=(
+                f"Olá {autor_mention or 'usuário'}, o seu atendimento foi iniciado!\n\n"
+                f"**Staff responsável:** {interaction.user.mention}\n\n"
+                "Por favor, descreva sua solicitação detalhadamente para agilizar o suporte."
+            ),
+            color=BRS_GREEN,
+        )
+        embed.set_footer(text="BRS — Ticket System")
+        await interaction.channel.send(embed=embed)
 
     @discord.ui.button(label="Fechar Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id="brs_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -606,6 +764,9 @@ class TicketControlView(discord.ui.View):
             )
 
         await canal.send(f"🔒 Ticket fechado por {interaction.user.mention}. Encerrando em 5 segundos...")
+        DADOS["tickets"].pop(str(canal.id), None)
+        _ULTIMA_RESPOSTA_IA.pop(canal.id, None)
+        salvar_dados(DADOS)
         await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
         await canal.delete(reason=f"Ticket fechado por {interaction.user}")
 
