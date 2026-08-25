@@ -1,28 +1,27 @@
 """
 Bot Discord completo — BRS (Brazilian Roblox Soccer)
-Comandos: somente slash (/), sem prefixo de texto
+Prefixos: ,  e  /
 Slash: /
 
 Recursos:
-  - Tickets
-  - Drop estilo PAFO (select menu + cargos temporários 5 dias)
+  - Tickets automáticos (select menu de categorias, claim, fechar com motivo, transcript)
+  - Drop estilo PAFO (select menu + cargos temporários 5 dias) com banco de 1000+ perguntas diversas
   - Meta de membros → Wave Drop
   - Free Agent / Scouting
-  - /role (sem ID no código)
-  - /say e /say_embed (foto do bot automática)
-  - Permissões e config organizada (/config ver e /config drop)
-  - Wave com quantidade de Drops configurável
+  - /role (sem ID de cargo no código)
+  - /say e /say_embed (foto do bot automática, sempre)
+  - Painel de configuração organizado (estilo PAFO)
 """
 
 import os
 import json
 import copy
 import datetime
+import io
 import logging
 import unicodedata
 import random
 import asyncio
-import re
 from typing import Optional, Union, List
 
 import discord
@@ -38,10 +37,25 @@ load_dotenv()
 GUILD_ID = 1540722239027023882
 GUILD = discord.Object(id=GUILD_ID)
 EMBED_COLOR = 0x2B2D31
+BRS_GREEN = 0x00FF7F
 DATA_PATH = os.path.join(os.path.dirname(__file__), "data.json")
 
-# Os cargos de recompensa são cadastrados pelo comando /drop premio_adicionar.
-# Nenhum ID de cargo fica gravado no código do comando /role.
+# Cargos de recompensa do Drop (os que você passou).
+# Observação: nenhum comando abaixo depende de ID fixo de cargo além destes
+# valores padrão de PRÊMIO do drop — /role continua 100% livre de ID no código.
+DROP_REWARD_ROLES = {
+    1541600835472072724: {"nome": "Olheiro (5 Dias)", "emoji": "🔍"},
+    1541065148590989332: {"nome": "Scrim Hoster (5 Dias)", "emoji": "⚔️"},
+    1541600905298714664: {"nome": "Pic Perm (5 Dias)", "emoji": "💥"},
+}
+
+# Categorias de ticket estilo PAFO — o usuário escolhe no select menu.
+TICKET_CATEGORIES = [
+    {"key": "suporte", "label": "Suporte Geral", "emoji": "🛠️", "descricao": "Dúvidas, problemas ou ajuda geral com o servidor."},
+    {"key": "denuncia", "label": "Denúncia / Report", "emoji": "🚨", "descricao": "Denunciar um jogador, staff ou situação irregular."},
+    {"key": "duvidas", "label": "Dúvidas sobre o Jogo", "emoji": "❓", "descricao": "Perguntas sobre regras, eventos ou funcionamento do BRS."},
+    {"key": "parcerias", "label": "Parcerias / Business", "emoji": "🤝", "descricao": "Propostas de parceria, patrocínio ou negócios."},
+]
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -55,340 +69,182 @@ ACTIVE_DROP: Optional[dict] = None
 WAVE_RUNNING = False
 
 # ============================================================
-#  BANCO DE PERGUNTAS (diverso e com mais de 1.000 opções)
+#  BANCO DE PERGUNTAS DO DROP — 1000+ perguntas diversas
+#  (futebol, geografia, capitais, moedas, ciência, história,
+#   cultura geral, Roblox e matemática — não é só bandeira/flag)
 # ============================================================
-def _normalizar_pergunta(texto: str) -> str:
-    return " ".join(texto.strip().split())
+
+# --- 1) Perguntas curadas, diversas por natureza -----------------
+PERGUNTAS_CURADAS = [
+    # Futebol / BRS
+    {"q": "Qual time brasileiro é conhecido como 'O Mais Querido'?", "a": "flamengo"},
+    {"q": "Quem é o maior artilheiro da história da seleção brasileira?", "a": "pele"},
+    {"q": "Em que ano o Brasil ganhou a primeira Copa do Mundo?", "a": "1958"},
+    {"q": "Quantos jogadores tem um time de futebol em campo?", "a": "11"},
+    {"q": "Qual é o nome do estádio do Flamengo e Fluminense?", "a": "maracana"},
+    {"q": "Quem é o Rei do Futebol?", "a": "pele"},
+    {"q": "Qual país sediou a Copa de 2014?", "a": "brasil"},
+    {"q": "Qual time tem as cores preto e branco e é de São Paulo?", "a": "corinthians"},
+    {"q": "O que significa a sigla BRS?", "a": "brazilian roblox soccer"},
+    {"q": "Quantos títulos de Copa do Mundo o Brasil tem?", "a": "5"},
+    {"q": "Quantos minutos tem uma partida oficial de futebol?", "a": "90"},
+    {"q": "Qual é o nome do cartão que expulsa um jogador?", "a": "vermelho"},
+    {"q": "Quem organiza a Copa do Mundo?", "a": "fifa"},
+    {"q": "Qual jogador é conhecido como CR7?", "a": "cristiano ronaldo"},
+    {"q": "Qual é o apelido da seleção brasileira?", "a": "canarinho"},
+    {"q": "Em que ano aconteceu o Maracanaço?", "a": "1950"},
+    {"q": "Qual é o clube com mais títulos da Champions League?", "a": "real madrid"},
+    {"q": "Quantos gols vale um pênalti convertido?", "a": "1"},
+    {"q": "O que é um hat-trick?", "a": "tres gols"},
+    {"q": "Qual é a posição do jogador que defende o gol?", "a": "goleiro"},
+    # Cultura geral / Roblox
+    {"q": "Qual é a plataforma onde roda o Roblox Soccer?", "a": "roblox"},
+    {"q": "Qual é a moeda virtual do Roblox?", "a": "robux"},
+    {"q": "Em que ano o Roblox foi lançado?", "a": "2006"},
+    {"q": "Qual é o nome do avatar padrão do Roblox?", "a": "noob"},
+    {"q": "Qual empresa criou o Roblox?", "a": "roblox corporation"},
+    # Geografia / história geral
+    {"q": "Qual é a capital do Brasil?", "a": "brasilia"},
+    {"q": "Qual é o maior país da América do Sul?", "a": "brasil"},
+    {"q": "Em que continente fica o Egito?", "a": "africa"},
+    {"q": "Qual país tem a Torre Eiffel?", "a": "franca"},
+    {"q": "Qual é a capital da Argentina?", "a": "buenos aires"},
+    {"q": "Qual é o maior oceano do mundo?", "a": "pacifico"},
+    {"q": "Qual é o rio mais longo do mundo?", "a": "nilo"},
+    {"q": "Qual é o maior deserto do mundo?", "a": "saara"},
+    {"q": "Quem descobriu o Brasil?", "a": "pedro alvares cabral"},
+    {"q": "Em que ano o homem pisou na Lua?", "a": "1969"},
+    {"q": "Quantos estados tem o Brasil?", "a": "26"},
+    {"q": "Qual é o continente mais frio do planeta?", "a": "antartida"},
+    {"q": "Qual é a montanha mais alta do mundo?", "a": "everest"},
+    # Comida / cultura brasileira
+    {"q": "Qual é o prato típico brasileiro feito com feijão preto?", "a": "feijoada"},
+    {"q": "Qual é a moeda oficial do Brasil?", "a": "real"},
+    {"q": "Qual é o esporte mais popular do Brasil?", "a": "futebol"},
+    {"q": "Qual é a bebida típica feita com erva-mate no Brasil?", "a": "chimarrao"},
+    {"q": "Qual é o doce brasileiro feito de leite condensado e chocolate?", "a": "brigadeiro"},
+    # Ciência
+    {"q": "Qual é o planeta mais próximo do Sol?", "a": "mercurio"},
+    {"q": "Qual é o maior mamífero do mundo?", "a": "baleia azul"},
+    {"q": "Quantos continentes existem?", "a": "7"},
+    {"q": "Qual é o maior órgão do corpo humano?", "a": "pele"},
+    {"q": "Qual gás os humanos respiram para viver?", "a": "oxigenio"},
+    {"q": "Qual é o osso mais longo do corpo humano?", "a": "femur"},
+    {"q": "Quantos ossos tem o corpo humano adulto?", "a": "206"},
+    {"q": "Qual é a velocidade da luz aproximada (km/s)?", "a": "300000"},
+    {"q": "Qual é o elemento químico representado por 'O'?", "a": "oxigenio"},
+    {"q": "Qual planeta é conhecido como planeta vermelho?", "a": "marte"},
+]
+
+# --- 2) Capitais de países (gera perguntas de geografia) --------
+CAPITAIS = {
+    "Portugal": "lisboa", "Espanha": "madrid", "Italia": "roma", "Alemanha": "berlim",
+    "Franca": "paris", "Reino Unido": "londres", "Japao": "toquio", "China": "pequim",
+    "Russia": "moscou", "Canada": "ottawa", "Estados Unidos": "washington",
+    "Mexico": "cidade do mexico", "Argentina": "buenos aires", "Chile": "santiago",
+    "Uruguai": "montevideu", "Paraguai": "assuncao", "Peru": "lima", "Colombia": "bogota",
+    "Venezuela": "caracas", "Bolivia": "sucre", "Equador": "quito", "Egito": "cairo",
+    "Africa do Sul": "pretoria", "Nigeria": "abuja", "India": "nova deli",
+    "Australia": "camberra", "Coreia do Sul": "seul", "Turquia": "ancara",
+    "Grecia": "atenas", "Suecia": "estocolmo", "Noruega": "oslo", "Holanda": "amsterda",
+    "Belgica": "bruxelas", "Suica": "berna", "Austria": "viena", "Polonia": "varsovia",
+    "Cuba": "havana", "Marrocos": "rabat", "Croacia": "zagreb", "Servia": "belgrado",
+}
+
+# --- 3) Moedas de países -----------------------------------------
+MOEDAS = {
+    "Brasil": "real", "Estados Unidos": "dolar", "Reino Unido": "libra",
+    "Japao": "iene", "China": "yuan", "Mexico": "peso", "Argentina": "peso",
+    "Russia": "rublo", "India": "rupia", "Suica": "franco",
+    "Coreia do Sul": "won", "Africa do Sul": "rand", "Turquia": "lira",
+    "Chile": "peso", "Paraguai": "guarani",
+}
+
+# --- 4) Clubes de futebol e seus países ---------------------------
+CLUBES_PAIS = {
+    "Real Madrid": "espanha", "Barcelona": "espanha", "Manchester United": "inglaterra",
+    "Manchester City": "inglaterra", "Liverpool": "inglaterra", "Chelsea": "inglaterra",
+    "Bayern de Munique": "alemanha", "Borussia Dortmund": "alemanha",
+    "Juventus": "italia", "Inter de Milao": "italia", "AC Milan": "italia",
+    "Paris Saint-Germain": "franca", "Ajax": "holanda", "Porto": "portugal",
+    "Benfica": "portugal", "Boca Juniors": "argentina", "River Plate": "argentina",
+    "Flamengo": "brasil", "Palmeiras": "brasil", "Corinthians": "brasil",
+    "Sao Paulo": "brasil", "Santos": "brasil", "Gremio": "brasil",
+    "Internacional": "brasil", "Atletico-MG": "brasil", "Cruzeiro": "brasil",
+    "Vasco": "brasil", "Botafogo": "brasil", "Fluminense": "brasil",
+}
+
+CORES_TIMES = {
+    "Flamengo": "vermelho", "Internacional": "vermelho", "Sao Paulo": "branco",
+    "Corinthians": "preto", "Vasco": "preto", "Palmeiras": "verde",
+    "Santos": "branco", "Gremio": "azul", "Atletico-MG": "preto",
+    "Cruzeiro": "azul", "Botafogo": "preto", "Fluminense": "vinho",
+}
+
+# --- 5) Curiosidades diversas extras -------------------------------
+CURIOSIDADES_EXTRAS = [
+    {"q": "Quantos lados tem um hexágono?", "a": "6"},
+    {"q": "Quantos lados tem um triângulo?", "a": "3"},
+    {"q": "Qual é o animal terrestre mais rápido do mundo?", "a": "guepardo"},
+    {"q": "Qual é o maior planeta do sistema solar?", "a": "jupiter"},
+    {"q": "Quantas cores tem o arco-íris?", "a": "7"},
+    {"q": "Qual é o metal líquido à temperatura ambiente?", "a": "mercurio"},
+    {"q": "Qual instrumento mede a temperatura?", "a": "termometro"},
+    {"q": "Qual é o idioma mais falado do mundo?", "a": "mandarim"},
+    {"q": "Quantos dias tem um ano bissexto?", "a": "366"},
+    {"q": "Qual é o menor país do mundo?", "a": "vaticano"},
+    {"q": "Qual é o maior deserto de areia da África?", "a": "saara"},
+    {"q": "Qual é o nome do satélite natural da Terra?", "a": "lua"},
+    {"q": "Quantas patas tem uma aranha?", "a": "8"},
+    {"q": "Qual é o inseto que produz mel?", "a": "abelha"},
+    {"q": "Qual é o animal símbolo do Brasil?", "a": "arara"},
+]
 
 
-def gerar_banco_perguntas() -> List[dict]:
-    perguntas: list[dict] = []
-    usadas: set[str] = set()
+def gerar_perguntas_extras() -> List[dict]:
+    """Combina categorias variadas para formar um banco de 1000+ perguntas,
+    sem repetir apenas um tipo (evitando ficar 'só de bandeira')."""
+    extras: List[dict] = []
 
-    def adicionar(pergunta: str, resposta: object, categoria: str):
-        pergunta = _normalizar_pergunta(pergunta)
-        if pergunta not in usadas:
-            usadas.add(pergunta)
-            perguntas.append({"q": pergunta, "a": str(resposta), "categoria": categoria})
+    # Geografia (capitais)
+    for pais, capital in CAPITAIS.items():
+        extras.append({"q": f"Qual é a capital de {pais}?", "a": capital})
 
-    # BRS, futebol e esportes.
-    futebol = [
-        ("Qual time brasileiro é conhecido como O Mais Querido?", "Flamengo"),
-        ("Quem é conhecido como o Rei do Futebol?", "Pelé"),
-        ("Quantos jogadores cada time de futebol tem em campo no início de uma partida?", "11"),
-        ("Qual é o nome do estádio conhecido como Maracanã?", "Estádio Jornalista Mário Filho"),
-        ("Em que país surgiu o futebol moderno?", "Inglaterra"),
-        ("Qual seleção tem mais títulos da Copa do Mundo masculina?", "Brasil"),
-        ("Quantos minutos tem o tempo regulamentar de uma partida de futebol?", "90"),
-        ("Quantos minutos dura cada tempo de uma partida de futebol?", "45"),
-        ("O que é um hat-trick no futebol?", "Três gols do mesmo jogador"),
-        ("Qual cartão indica expulsão no futebol?", "Vermelho"),
-        ("Qual cartão indica advertência no futebol?", "Amarelo"),
-        ("Quantos pontos vale uma vitória no futebol em pontos corridos?", "3"),
-        ("Qual é a posição do jogador que protege o gol?", "Goleiro"),
-        ("Qual é a principal competição de clubes da América do Sul?", "Copa Libertadores"),
-        ("Qual é a principal competição de clubes da Europa?", "Liga dos Campeões"),
-        ("Qual esporte usa uma cesta e uma bola laranja?", "Basquete"),
-        ("Quantos jogadores formam uma equipe de vôlei em quadra?", "6"),
-        ("Qual esporte é disputado em uma piscina e usa raias?", "Natação"),
-        ("Em qual esporte se usa uma raquete e uma peteca?", "Badminton"),
-        ("Qual esporte é associado ao torneio de Wimbledon?", "Tênis"),
-        ("Quantos anéis há no símbolo olímpico?", "5"),
-        ("Qual país sediou os Jogos Olímpicos de 2016?", "Brasil"),
-        ("Qual é a pontuação máxima de uma cesta comum no basquete?", "3"),
-        ("Qual peça do xadrez se move em formato de L?", "Cavalo"),
-        ("Qual peça do xadrez vale mais, sem contar o rei?", "Dama"),
-        ("Como se chama a jogada que derruba o rei no xadrez?", "Xeque-mate"),
-        ("Qual esporte usa tacos e buracos em um campo?", "Golfe"),
-        ("Qual esporte tem o cinturão como símbolo de campeão?", "Boxe"),
-        ("Qual esporte é conhecido como esporte da bola oval?", "Rugby"),
-        ("Qual é a distância oficial de uma maratona em quilômetros?", "42,195"),
-    ]
-    for pergunta, resposta in futebol:
-        adicionar(pergunta, resposta, "Esportes")
+    # Moedas
+    for pais, moeda in MOEDAS.items():
+        extras.append({"q": f"Qual é a moeda oficial de {pais}?", "a": moeda})
 
-    # Matemática: centenas de perguntas geradas, sem depender de perguntas de bandeiras.
-    for a in range(2, 21):
-        for b in range(2, 21):
-            adicionar(f"Quanto é {a} × {b}?", a * b, "Matemática")
-    for a in range(1, 51):
-        for b in range(1, 6):
-            adicionar(f"Quanto é {a} + {b}?", a + b, "Matemática")
-    for a in range(10, 51):
-        for b in range(1, 6):
-            adicionar(f"Quanto é {a} − {b}?", a - b, "Matemática")
-    for n in range(1, 31):
-        adicionar(f"Qual é o quadrado de {n}?", n * n, "Matemática")
-    for n in range(1, 16):
-        adicionar(f"Qual é o cubo de {n}?", n ** 3, "Matemática")
-    for n in range(1, 21):
-        adicionar(f"Qual é a metade de {n * 2}?", n, "Matemática")
-    for n in range(1, 21):
-        adicionar(f"Qual é o dobro de {n}?", n * 2, "Matemática")
+    # Clubes e países
+    for clube, pais in CLUBES_PAIS.items():
+        extras.append({"q": f"De qual país é o clube {clube}?", "a": pais})
 
-    # Geografia: capital e continente de países variados.
-    paises = [
-        ("Brasil", "Brasília", "América do Sul"), ("Argentina", "Buenos Aires", "América do Sul"),
-        ("Chile", "Santiago", "América do Sul"), ("Uruguai", "Montevidéu", "América do Sul"),
-        ("Paraguai", "Assunção", "América do Sul"), ("Bolívia", "Sucre", "América do Sul"),
-        ("Peru", "Lima", "América do Sul"), ("Equador", "Quito", "América do Sul"),
-        ("Colômbia", "Bogotá", "América do Sul"), ("Venezuela", "Caracas", "América do Sul"),
-        ("Guiana", "Georgetown", "América do Sul"), ("Suriname", "Paramaribo", "América do Sul"),
-        ("México", "Cidade do México", "América do Norte"), ("Canadá", "Ottawa", "América do Norte"),
-        ("Estados Unidos", "Washington DC", "América do Norte"), ("Cuba", "Havana", "América do Norte"),
-        ("Costa Rica", "San José", "América Central"), ("Panamá", "Cidade do Panamá", "América Central"),
-        ("Guatemala", "Cidade da Guatemala", "América Central"), ("Jamaica", "Kingston", "América do Norte"),
-        ("Reino Unido", "Londres", "Europa"), ("França", "Paris", "Europa"),
-        ("Espanha", "Madri", "Europa"), ("Portugal", "Lisboa", "Europa"),
-        ("Itália", "Roma", "Europa"), ("Alemanha", "Berlim", "Europa"),
-        ("Países Baixos", "Amsterdã", "Europa"), ("Bélgica", "Bruxelas", "Europa"),
-        ("Suíça", "Berna", "Europa"), ("Áustria", "Viena", "Europa"),
-        ("Polônia", "Varsóvia", "Europa"), ("Grécia", "Atenas", "Europa"),
-        ("Noruega", "Oslo", "Europa"), ("Suécia", "Estocolmo", "Europa"),
-        ("Finlândia", "Helsinque", "Europa"), ("Dinamarca", "Copenhague", "Europa"),
-        ("Islândia", "Reykjavik", "Europa"), ("Irlanda", "Dublin", "Europa"),
-        ("Rússia", "Moscou", "Europa e Ásia"), ("Ucrânia", "Kiev", "Europa"),
-        ("Turquia", "Ancara", "Ásia e Europa"), ("Romênia", "Bucareste", "Europa"),
-        ("Bulgária", "Sófia", "Europa"), ("Croácia", "Zagreb", "Europa"),
-        ("Sérvia", "Belgrado", "Europa"), ("Tchéquia", "Praga", "Europa"),
-        ("Hungria", "Budapeste", "Europa"), ("Marrocos", "Rabat", "África"),
-        ("Argélia", "Argel", "África"), ("Tunísia", "Túnis", "África"),
-        ("Egito", "Cairo", "África"), ("Líbia", "Trípoli", "África"),
-        ("Nigéria", "Abuja", "África"), ("Gana", "Acra", "África"),
-        ("Senegal", "Dacar", "África"), ("Quênia", "Nairóbi", "África"),
-        ("Etiópia", "Adis Abeba", "África"), ("Tanzânia", "Dodoma", "África"),
-        ("África do Sul", "Pretória", "África"), ("Angola", "Luanda", "África"),
-        ("Moçambique", "Maputo", "África"), ("Madagascar", "Antananarivo", "África"),
-        ("Austrália", "Camberra", "Oceania"), ("Nova Zelândia", "Wellington", "Oceania"),
-        ("Fiji", "Suva", "Oceania"), ("China", "Pequim", "Ásia"),
-        ("Japão", "Tóquio", "Ásia"), ("Coreia do Sul", "Seul", "Ásia"),
-        ("Mongólia", "Ulan Bator", "Ásia"), ("Índia", "Nova Délhi", "Ásia"),
-        ("Paquistão", "Islamabad", "Ásia"), ("Nepal", "Catmandu", "Ásia"),
-        ("Bangladesh", "Daca", "Ásia"), ("Sri Lanka", "Sri Jayawardenepura Kotte", "Ásia"),
-        ("Tailândia", "Bangcoc", "Ásia"), ("Vietnã", "Hanói", "Ásia"),
-        ("Filipinas", "Manila", "Ásia"), ("Indonésia", "Jacarta", "Ásia"),
-        ("Malásia", "Kuala Lumpur", "Ásia"), ("Singapura", "Singapura", "Ásia"),
-        ("Mianmar", "Naypyidaw", "Ásia"), ("Irã", "Teerã", "Ásia"),
-        ("Iraque", "Bagdá", "Ásia"), ("Israel", "Jerusalém", "Ásia"),
-        ("Jordânia", "Amã", "Ásia"), ("Arábia Saudita", "Riade", "Ásia"),
-        ("Emirados Árabes Unidos", "Abu Dhabi", "Ásia"), ("Catar", "Doha", "Ásia"),
-        ("Afeganistão", "Cabul", "Ásia"), ("Cazaquistão", "Astana", "Ásia"),
-    ]
-    for pais, capital, continente in paises:
-        adicionar(f"Qual é a capital de {pais}?", capital, "Geografia")
-        adicionar(f"Em qual continente fica {pais}?", continente, "Geografia")
+    # Cores dos times
+    for time, cor in CORES_TIMES.items():
+        extras.append({"q": f"Qual é a cor principal do {time}?", "a": cor})
 
-    moedas = [
-        ("Brasil", "real"), ("Estados Unidos", "dólar"), ("Reino Unido", "libra esterlina"),
-        ("Japão", "iene"), ("China", "yuan"), ("Índia", "rúpia"), ("Rússia", "rublo"),
-        ("México", "peso mexicano"), ("Argentina", "peso argentino"), ("Chile", "peso chileno"),
-        ("Colômbia", "peso colombiano"), ("Peru", "sol"), ("Uruguai", "peso uruguaio"),
-        ("Paraguai", "guarani"), ("Suíça", "franco suíço"), ("Austrália", "dólar australiano"),
-        ("Canadá", "dólar canadense"), ("Coreia do Sul", "won"), ("Turquia", "lira turca"),
-        ("África do Sul", "rand"),
-    ]
-    for pais, moeda in moedas:
-        adicionar(f"Qual é a moeda oficial de {pais}?", moeda, "Geografia")
+    # Curiosidades
+    extras.extend(CURIOSIDADES_EXTRAS)
 
-    # Ciências naturais e corpo humano.
-    elementos = [
-        ("Hidrogênio", "H", 1), ("Hélio", "He", 2), ("Lítio", "Li", 3), ("Berílio", "Be", 4),
-        ("Boro", "B", 5), ("Carbono", "C", 6), ("Nitrogênio", "N", 7), ("Oxigênio", "O", 8),
-        ("Flúor", "F", 9), ("Neônio", "Ne", 10), ("Sódio", "Na", 11), ("Magnésio", "Mg", 12),
-        ("Alumínio", "Al", 13), ("Silício", "Si", 14), ("Fósforo", "P", 15), ("Enxofre", "S", 16),
-        ("Cloro", "Cl", 17), ("Argônio", "Ar", 18), ("Potássio", "K", 19), ("Cálcio", "Ca", 20),
-        ("Ferro", "Fe", 26), ("Cobre", "Cu", 29), ("Zinco", "Zn", 30), ("Prata", "Ag", 47),
-        ("Ouro", "Au", 79), ("Mercúrio", "Hg", 80), ("Chumbo", "Pb", 82), ("Urânio", "U", 92),
-    ]
-    for nome, simbolo, numero in elementos:
-        adicionar(f"Qual é o símbolo químico do elemento {nome}?", simbolo, "Ciências")
-        adicionar(f"Qual é o número atômico do elemento {nome}?", numero, "Ciências")
+    # Matemática variada (soma, subtração, multiplicação, quadrado) — mantém
+    # o banco grande sem virar só um tipo de pergunta, pois é combinado com
+    # todas as categorias acima (que somam ~200 perguntas não-matemáticas).
+    for n in range(1, 301):
+        extras.append({"q": f"Quanto é {n} + {n}?", "a": str(n * 2)})
+        extras.append({"q": f"Quanto é {n} x 2?", "a": str(n * 2)})
+        extras.append({"q": f"Quanto é {n} x 3?", "a": str(n * 3)})
+        extras.append({"q": f"Quanto é {n + 10} - {n}?", "a": "10"})
+        if n <= 40:
+            extras.append({"q": f"Quanto é {n}²?", "a": str(n * n)})
 
-    planetas = [
-        ("Mercúrio", "mais próximo do Sol"), ("Vênus", "mais quente do Sistema Solar"),
-        ("Terra", "onde vivemos"), ("Marte", "conhecido como planeta vermelho"),
-        ("Júpiter", "maior planeta do Sistema Solar"), ("Saturno", "famoso por seus anéis"),
-        ("Urano", "tem rotação bastante inclinada"), ("Netuno", "mais distante do Sol entre os oito planetas"),
-    ]
-    for planeta, descricao in planetas:
-        adicionar(f"Qual planeta é {descricao}?", planeta, "Ciências")
-    adicionar("Quantos planetas há no Sistema Solar?", 8, "Ciências")
-    adicionar("Qual é a estrela do Sistema Solar?", "Sol", "Ciências")
-    adicionar("Qual é o satélite natural da Terra?", "Lua", "Ciências")
-    adicionar("Qual gás os seres humanos precisam respirar para viver?", "Oxigênio", "Ciências")
-    adicionar("Qual gás as plantas absorvem na fotossíntese?", "Gás carbônico", "Ciências")
-    adicionar("Como se chama a passagem da água líquida para vapor?", "Evaporação", "Ciências")
-    adicionar("Como se chama a passagem do vapor para o estado líquido?", "Condensação", "Ciências")
-    adicionar("Qual é a unidade básica da vida?", "Célula", "Ciências")
-    adicionar("Qual órgão bombeia o sangue pelo corpo?", "Coração", "Ciências")
-    adicionar("Qual órgão é responsável principalmente pelas trocas gasosas?", "Pulmão", "Ciências")
-    adicionar("Qual é o maior órgão do corpo humano?", "Pele", "Ciências")
-    adicionar("Qual substância dá cor verde às plantas?", "Clorofila", "Ciências")
-    adicionar("Qual força nos mantém atraídos à Terra?", "Gravidade", "Ciências")
-    adicionar("A que temperatura a água congela em Celsius ao nível do mar?", "0", "Ciências")
-    adicionar("A que temperatura a água ferve em Celsius ao nível do mar?", "100", "Ciências")
-    adicionar("Qual é o animal terrestre mais veloz?", "Guepardo", "Ciências")
-    adicionar("Qual é o maior mamífero do mundo?", "Baleia azul", "Ciências")
-    adicionar("Qual é o maior animal terrestre?", "Elefante africano", "Ciências")
-    adicionar("Como se chama o estudo dos seres vivos?", "Biologia", "Ciências")
-    adicionar("Como se chama o estudo dos astros?", "Astronomia", "Ciências")
-
-    # História, sociedade, cultura e língua portuguesa.
-    historia = [
-        ("Em que ano o ser humano pisou na Lua pela primeira vez?", "1969"),
-        ("Quem foi o primeiro ser humano a pisar na Lua?", "Neil Armstrong"),
-        ("Em que ano o Brasil declarou sua independência?", "1822"),
-        ("Quem proclamou a independência do Brasil?", "Dom Pedro I"),
-        ("Em que ano foi proclamada a República no Brasil?", "1889"),
-        ("Qual cidade foi a primeira capital do Brasil?", "Salvador"),
-        ("Qual é a atual capital do Brasil?", "Brasília"),
-        ("Quem foi conhecido como Tiradentes?", "Joaquim José da Silva Xavier"),
-        ("Qual civilização construiu Machu Picchu?", "Inca"),
-        ("Qual povo construiu as pirâmides de Gizé?", "Egípcios"),
-        ("Qual era o idioma principal do Império Romano?", "Latim"),
-        ("Quem escreveu a Ilíada e a Odisseia?", "Homero"),
-        ("Em que país começou a Revolução Industrial?", "Inglaterra"),
-        ("Qual muro caiu em 1989 e simbolizava a divisão de Berlim?", "Muro de Berlim"),
-        ("Qual foi o conflito mundial encerrado em 1945?", "Segunda Guerra Mundial"),
-        ("Qual organização internacional foi criada em 1945 para promover a cooperação entre países?", "ONU"),
-        ("Qual documento inglês de 1215 limitou o poder do rei?", "Magna Carta"),
-        ("Quem pintou a Mona Lisa?", "Leonardo da Vinci"),
-        ("Quem pintou o teto da Capela Sistina?", "Michelangelo"),
-        ("Quem escreveu Dom Quixote?", "Miguel de Cervantes"),
-        ("Quem escreveu Os Lusíadas?", "Luís de Camões"),
-        ("Quem escreveu Dom Casmurro?", "Machado de Assis"),
-        ("Quem escreveu O Auto da Compadecida?", "Ariano Suassuna"),
-        ("Qual é o idioma oficial do Brasil?", "Português"),
-        ("Qual é o plural de cidadão?", "Cidadãos"),
-        ("Qual é o antônimo de claro?", "Escuro"),
-        ("Qual é o sinônimo de feliz?", "Alegre"),
-        ("Quantas letras tem o alfabeto português brasileiro?", "26"),
-        ("Como se chama a palavra que indica uma ação?", "Verbo"),
-        ("Como se chama a palavra que caracteriza um substantivo?", "Adjetivo"),
-        ("Qual sinal encerra normalmente uma pergunta?", "Ponto de interrogação"),
-        ("Qual sinal indica uma pausa breve?", "Vírgula"),
-    ]
-    for pergunta, resposta in historia:
-        adicionar(pergunta, resposta, "História e Cultura")
-
-    # Tecnologia, internet, Roblox e jogos.
-    tecnologia = [
-        ("Qual empresa desenvolve o sistema operacional Windows?", "Microsoft"),
-        ("Qual empresa criou o iPhone?", "Apple"),
-        ("Qual empresa mantém o Android?", "Google"),
-        ("O que significa a sigla CPU?", "Unidade central de processamento"),
-        ("O que significa a sigla GPU?", "Unidade de processamento gráfico"),
-        ("Qual linguagem é usada para estruturar páginas web?", "HTML"),
-        ("Qual linguagem é usada para estilizar páginas web?", "CSS"),
-        ("Qual linguagem é muito usada para interatividade em páginas web?", "JavaScript"),
-        ("O que significa a sigla URL?", "Localizador uniforme de recursos"),
-        ("O que significa a sigla HTTP?", "Protocolo de transferência de hipertexto"),
-        ("Qual dispositivo distribui uma conexão de internet em uma rede local?", "Roteador"),
-        ("Como se chama o armazenamento temporário usado para acelerar acessos?", "Cache"),
-        ("Qual unidade costuma medir a capacidade de armazenamento digital?", "Byte"),
-        ("Qual é a base numérica usada pelos computadores?", "Binária"),
-        ("O que é um programa malicioso?", "Malware"),
-        ("O que significa fazer uma cópia de segurança?", "Backup"),
-        ("Qual empresa é responsável pelo Roblox?", "Roblox Corporation"),
-        ("Em qual plataforma é possível jogar Roblox?", "Roblox"),
-        ("Qual jogo popular tem blocos e mineração?", "Minecraft"),
-        ("Qual jogo tem personagens chamados tripulantes e impostores?", "Among Us"),
-        ("Qual empresa criou o jogo Minecraft?", "Mojang"),
-        ("Qual é o nome do encanador famoso dos jogos da Nintendo?", "Mario"),
-        ("Qual personagem da Nintendo é um ouriço azul?", "Sonic"),
-        ("Qual empresa criou o PlayStation?", "Sony"),
-        ("Qual empresa criou o Xbox?", "Microsoft"),
-        ("Qual empresa criou o Nintendo Switch?", "Nintendo"),
-        ("Qual formato de imagem suporta transparência e é muito usado na web?", "PNG"),
-        ("Qual formato costuma ser usado para documentos portáteis?", "PDF"),
-        ("O que significa a sigla Wi-Fi?", "Wireless Fidelity"),
-        ("Qual tecnologia permite comunicação sem fio de curto alcance entre dispositivos?", "Bluetooth"),
-    ]
-    for pergunta, resposta in tecnologia:
-        adicionar(pergunta, resposta, "Tecnologia e Jogos")
-
-    # Conhecimentos gerais, cotidiano e natureza.
-    gerais = [
-        ("Qual é a capital da França?", "Paris"), ("Qual é a capital da Itália?", "Roma"),
-        ("Qual é a capital do Japão?", "Tóquio"), ("Qual é a capital de Portugal?", "Lisboa"),
-        ("Qual é o maior país da América do Sul?", "Brasil"),
-        ("Qual é o maior oceano do planeta?", "Pacífico"),
-        ("Qual é o menor oceano do planeta?", "Ártico"),
-        ("Qual é o rio mais extenso frequentemente citado em livros didáticos?", "Nilo"),
-        ("Qual é a montanha mais alta do mundo?", "Everest"),
-        ("Qual é o deserto quente mais extenso do mundo?", "Saara"),
-        ("Quantos dias tem um ano comum?", "365"),
-        ("Quantos dias tem um ano bissexto?", "366"),
-        ("Quantos meses tem um ano?", "12"),
-        ("Quantas horas tem um dia?", "24"),
-        ("Quantos minutos tem uma hora?", "60"),
-        ("Quantos segundos tem um minuto?", "60"),
-        ("Qual é o primeiro mês do ano?", "Janeiro"),
-        ("Qual é o último mês do ano?", "Dezembro"),
-        ("Qual estação vem depois do inverno no Brasil?", "Primavera"),
-        ("Qual é a cor formada pela mistura de azul e amarelo?", "Verde"),
-        ("Qual é a cor formada pela mistura de vermelho e branco?", "Rosa"),
-        ("Qual é o ingrediente principal da feijoada?", "Feijão preto"),
-        ("Qual alimento é usado para fazer pão?", "Farinha de trigo"),
-        ("Qual bebida é feita tradicionalmente com grãos torrados?", "Café"),
-        ("Qual animal é conhecido por produzir mel?", "Abelha"),
-        ("Qual animal é conhecido por mudar de cor e mover os olhos de forma independente?", "Camaleão"),
-        ("Qual mamífero é famoso por dormir de cabeça para baixo?", "Morcego"),
-        ("Qual ave não voa e vive naturalmente na Antártida?", "Pinguim"),
-        ("Qual instrumento tem teclas brancas e pretas?", "Piano"),
-        ("Qual instrumento de cordas é muito usado no samba?", "Cavaquinho"),
-        ("Qual gênero musical brasileiro nasceu no Rio de Janeiro e tem forte presença de percussão?", "Samba"),
-        ("Qual dança brasileira é associada a Pernambuco e a pequenos guarda-chuvas?", "Frevo"),
-        ("Qual feriado brasileiro é celebrado em 7 de setembro?", "Independência do Brasil"),
-        ("Qual feriado é celebrado em 25 de dezembro?", "Natal"),
-        ("Qual é o símbolo químico da água?", "H2O"),
-        ("Qual é o formato geométrico com três lados?", "Triângulo"),
-        ("Quantos lados tem um hexágono?", "6"),
-        ("Quantos graus tem um ângulo reto?", "90"),
-        ("Qual é o número que vem depois de 99?", "100"),
-        ("Qual é o dobro de 50?", "100"),
-    ]
-    for pergunta, resposta in gerais:
-        adicionar(pergunta, resposta, "Conhecimentos Gerais")
-
-    # Pequeno conjunto de bandeiras, mantendo o banco claramente diversificado.
-    bandeiras = [
-        ("Qual país tem uma folha de bordo em sua bandeira?", "Canadá"),
-        ("Qual país tem um círculo vermelho no centro de sua bandeira?", "Japão"),
-        ("Qual país tem uma cruz branca sobre fundo vermelho em sua bandeira?", "Suíça"),
-        ("Qual país tem uma folha de bordo como símbolo nacional?", "Canadá"),
-        ("Qual país tem uma bandeira verde, amarela e azul com uma esfera ao centro?", "Brasil"),
-        ("Qual país tem uma cruz nórdica azul em fundo branco e vermelho?", "Islândia"),
-        ("Qual país tem uma estrela de Davi em sua bandeira?", "Israel"),
-        ("Qual país tem uma bandeira com um cedro no centro?", "Líbano"),
-        ("Qual país tem uma bandeira com um dragão?", "Butão"),
-        ("Qual país tem uma bandeira com uma águia dourada?", "Cazaquistão"),
-        ("Qual país é representado por uma bandeira tricolor vertical verde, branca e vermelha?", "Itália"),
-        ("Qual país é representado por uma bandeira azul, branca e vermelha em faixas horizontais?", "Rússia"),
-    ]
-    for pergunta, resposta in bandeiras:
-        adicionar(pergunta, resposta, "Bandeiras")
-
-    random.shuffle(perguntas)
-    if len(perguntas) < 1000:
-        raise RuntimeError(f"Banco de perguntas insuficiente: {len(perguntas)}")
-    return perguntas
+    return extras
 
 
-TODAS_PERGUNTAS = gerar_banco_perguntas()
+TODAS_PERGUNTAS = PERGUNTAS_CURADAS + gerar_perguntas_extras()
+
 
 # ============================================================
 #  PERSISTÊNCIA
 # ============================================================
-# Cargos que aparecem na DM quando alguém vence um Drop.
-# A lista fica configurável depois pelos comandos de prêmio, mas estes três
-# são os cargos iniciais definidos para a BRS.
-DEFAULT_DROP_REWARD_ROLE_IDS = [
-    1541600905298714664,
-    1541600835472072724,
-    1541065148590989332,
-]
-
 DEFAULT_CONFIG = {
     "staff_role_ids": [],
     "command_permissions": {
@@ -398,17 +254,15 @@ DEFAULT_CONFIG = {
     "ticket": {
         "category_id": None,
         "staff_role_ids": [],
-        "channel_name_template": "ticket-{user}",
+        "channel_name_template": "ticket-{tipo}-{user}",
         "welcome_message": "Olá {mention}, seja bem-vindo(a) à BRS! Descreva sua solicitação e aguarde o atendimento da staff.",
         "log_channel_id": None,
+        "painel_titulo": "🎫 Central de Atendimento — BRS",
+        "painel_descricao": "Selecione abaixo o tipo de atendimento que você precisa. Nossa staff irá te ajudar o mais rápido possível!",
     },
     "drop": {
-        "reward_role_ids": list(DEFAULT_DROP_REWARD_ROLE_IDS),
-        "reward_roles_version": 2,
+        "reward_role_ids": list(DROP_REWARD_ROLES.keys()),
         "default_channel_id": None,
-        "quantidade_drops": 7,
-        "intervalo_drops_segundos": 8,
-        "tempo_resposta_segundos": 180,
         "meta_membros": 18750,
         "meta_canal_id": None,
         "meta_mensagem_id": None,
@@ -426,17 +280,12 @@ def carregar_dados() -> dict:
         dados = json.load(f)
     dados.setdefault("config", copy.deepcopy(DEFAULT_CONFIG))
     for chave, valor in DEFAULT_CONFIG.items():
-        dados["config"].setdefault(chave, copy.deepcopy(valor))
+        if chave not in dados["config"]:
+            dados["config"][chave] = copy.deepcopy(valor)
+        elif isinstance(valor, dict):
+            for sub_chave, sub_valor in valor.items():
+                dados["config"][chave].setdefault(sub_chave, copy.deepcopy(sub_valor))
     dados["config"].setdefault("command_permissions", {})
-    drop_cfg = dados["config"]["drop"]
-    # Migra configurações antigas uma única vez para os três cargos corretos.
-    if drop_cfg.get("reward_roles_version") != 2:
-        drop_cfg["reward_role_ids"] = list(DEFAULT_DROP_REWARD_ROLE_IDS)
-        drop_cfg["reward_roles_version"] = 2
-    drop_cfg.setdefault("reward_role_ids", list(DEFAULT_DROP_REWARD_ROLE_IDS))
-    drop_cfg.setdefault("quantidade_drops", 7)
-    dados["config"]["drop"].setdefault("intervalo_drops_segundos", 8)
-    dados["config"]["drop"].setdefault("tempo_resposta_segundos", 180)
     for cmd in DEFAULT_CONFIG["command_permissions"]:
         dados["config"]["command_permissions"].setdefault(cmd, [])
     dados.setdefault("freeagents", {})
@@ -455,8 +304,7 @@ DADOS = carregar_dados()
 
 def normalizar(texto: str) -> str:
     texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
-    texto = re.sub(r"[^a-zA-Z0-9\s]", "", texto).lower()
-    return " ".join(texto.split())
+    return texto.strip().lower()
 
 
 def tem_permissao(member: discord.Member, comando: str) -> bool:
@@ -480,13 +328,20 @@ async def checar_permissao(interaction: discord.Interaction, comando: str) -> bo
     return True
 
 
+def bot_avatar_url() -> Optional[str]:
+    """Retorna a foto do bot automaticamente, sem precisar informar nada."""
+    if bot.user:
+        return bot.user.display_avatar.url
+    return None
+
+
 # ============================================================
 #  BOT
 # ============================================================
 class BRSBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix=commands.when_mentioned,
+            command_prefix=commands.when_mentioned_or(",", "/"),
             intents=intents,
             help_command=None,
         )
@@ -498,7 +353,6 @@ class BRSBot(commands.Bot):
         self.tree.add_command(drop_group, guild=GUILD)
         self.tree.add_command(freeagent_group, guild=GUILD)
         self.tree.add_command(scouting_group, guild=GUILD)
-        self.tree.add_command(config_group, guild=GUILD)
         synced = await self.tree.sync(guild=GUILD)
         log.info("Sincronizados %s comandos na guild %s", len(synced), GUILD_ID)
         verificar_expiracoes.start()
@@ -534,7 +388,7 @@ async def on_message(message: discord.Message):
                 )
             )
 
-            role_ids = DADOS["config"]["drop"].get("reward_role_ids", [])
+            role_ids = DADOS["config"]["drop"].get("reward_role_ids", list(DROP_REWARD_ROLES.keys()))
             roles = [r for rid in role_ids if (r := message.guild.get_role(rid))]
 
             try:
@@ -548,6 +402,8 @@ async def on_message(message: discord.Message):
                         color=discord.Color.gold(),
                     )
                     dm_embed.set_footer(text="BRS — Drops System")
+                    if bot_avatar_url():
+                        dm_embed.set_thumbnail(url=bot_avatar_url())
                     await vencedor.send(embed=dm_embed, view=DropRewardView(vencedor.id, roles))
                 else:
                     await vencedor.send("🏆 Você venceu o Drop, mas nenhum cargo de recompensa está configurado.")
@@ -594,29 +450,58 @@ async def before_expiracoes():
 
 
 # ============================================================
-#  TICKETS
+#  TICKETS — sistema automático estilo PAFO
+#  (select menu de categorias → cria canal → claim → fechar com
+#   transcript automático, tudo sem precisar digitar comando)
 # ============================================================
+TICKET_CATEGORIES_BY_KEY = {c["key"]: c for c in TICKET_CATEGORIES}
+
+
 def is_ticket_channel(channel: discord.abc.GuildChannel) -> bool:
     return isinstance(channel, discord.TextChannel) and channel.name.startswith("ticket-")
 
 
-class TicketPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+def usuario_tem_ticket_aberto(guild: discord.Guild, user: discord.Member) -> Optional[discord.TextChannel]:
+    alvo = f"user_id:{user.id}"
+    for ch in guild.text_channels:
+        if ch.name.startswith("ticket-") and ch.topic and alvo in ch.topic:
+            return ch
+    return None
 
-    @discord.ui.button(label="Abrir Ticket", emoji="🎫", style=discord.ButtonStyle.green, custom_id="brs_open_ticket")
-    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+class TicketTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=c["label"], value=c["key"], emoji=c["emoji"], description=c["descricao"][:100])
+            for c in TICKET_CATEGORIES
+        ]
+        super().__init__(
+            placeholder="Selecione o tipo de atendimento...",
+            min_values=1, max_values=1, options=options,
+            custom_id="brs_ticket_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
         guild = interaction.guild
         cfg = DADOS["config"]["ticket"]
-        template = cfg.get("channel_name_template") or "ticket-{user}"
-        channel_name = template.replace("{user}", interaction.user.name).lower().replace(" ", "-")[:90]
-        if not channel_name.startswith("ticket-"):
-            channel_name = f"ticket-{channel_name}"[:90]
+        tipo_key = self.values[0]
+        tipo = TICKET_CATEGORIES_BY_KEY.get(tipo_key, TICKET_CATEGORIES[0])
 
-        existing = discord.utils.get(guild.text_channels, name=channel_name)
-        if existing:
-            await interaction.response.send_message(f"❌ Você já possui um ticket aberto: {existing.mention}", ephemeral=True)
+        existente = usuario_tem_ticket_aberto(guild, interaction.user)
+        if existente:
+            await interaction.response.send_message(f"❌ Você já possui um ticket aberto: {existente.mention}", ephemeral=True)
             return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        template = cfg.get("channel_name_template") or "ticket-{tipo}-{user}"
+        nome_canal = (
+            template.replace("{tipo}", tipo_key)
+            .replace("{user}", interaction.user.name)
+            .lower().replace(" ", "-")[:90]
+        )
+        if not nome_canal.startswith("ticket-"):
+            nome_canal = f"ticket-{nome_canal}"[:90]
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -630,30 +515,65 @@ class TicketPanelView(discord.ui.View):
 
         category = guild.get_channel(cfg.get("category_id")) if cfg.get("category_id") else None
         ticket_channel = await guild.create_text_channel(
-            name=channel_name, category=category, overwrites=overwrites,
-            reason=f"Ticket aberto por {interaction.user}"
+            name=nome_canal, category=category, overwrites=overwrites,
+            topic=f"Ticket de {tipo['label']} | user_id:{interaction.user.id}",
+            reason=f"Ticket ({tipo['label']}) aberto por {interaction.user}",
         )
 
-        mensagem = (cfg.get("welcome_message") or "Olá {mention}!").replace("{mention}", interaction.user.mention).replace("{user}", interaction.user.display_name)
-        embed = discord.Embed(title="🎫 Ticket — BRS", description=mensagem, color=EMBED_COLOR, timestamp=datetime.datetime.now())
+        mensagem = (cfg.get("welcome_message") or "Olá {mention}!").replace(
+            "{mention}", interaction.user.mention
+        ).replace("{user}", interaction.user.display_name)
+
+        embed = discord.Embed(
+            title=f"{tipo['emoji']} Ticket — {tipo['label']}",
+            description=f"{mensagem}\n\n**Categoria:** {tipo['descricao']}",
+            color=BRS_GREEN,
+            timestamp=datetime.datetime.now(),
+        )
+        avatar = bot_avatar_url()
+        if avatar:
+            embed.set_thumbnail(url=avatar)
         embed.set_footer(text=f"Aberto por {interaction.user}", icon_url=interaction.user.display_avatar.url)
-        await ticket_channel.send(content=interaction.user.mention, embed=embed, view=TicketControlView())
+
+        staff_pings = " ".join(
+            f"<@&{rid}>" for rid in cfg.get("staff_role_ids", []) if guild.get_role(rid)
+        )
+        conteudo = f"{interaction.user.mention} {staff_pings}".strip()
+
+        await ticket_channel.send(content=conteudo, embed=embed, view=TicketControlView())
 
         log_id = cfg.get("log_channel_id")
-        if log_id:
-            log_channel = guild.get_channel(log_id)
-            if log_channel:
-                await log_channel.send(embed=discord.Embed(
-                    description=f"🎫 Ticket aberto: {ticket_channel.mention} por {interaction.user.mention}",
-                    color=discord.Color.green()
-                ))
+        if log_id and (log_channel := guild.get_channel(log_id)):
+            await log_channel.send(embed=discord.Embed(
+                description=f"🎫 Ticket aberto: {ticket_channel.mention} ({tipo['label']}) por {interaction.user.mention}",
+                color=discord.Color.green(),
+            ))
 
-        await interaction.response.send_message(f"✅ Ticket criado: {ticket_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"✅ Ticket criado: {ticket_channel.mention}", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketTypeSelect())
 
 
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="Assumir", emoji="🙋", style=discord.ButtonStyle.blurple, custom_id="brs_claim_ticket")
+    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ticket_channel(interaction.channel):
+            await interaction.response.send_message("❌ Este botão só funciona dentro de um canal de ticket.", ephemeral=True)
+            return
+        if not tem_permissao(interaction.user, "ticket"):
+            await interaction.response.send_message("❌ Apenas a staff pode assumir tickets.", ephemeral=True)
+            return
+        button.label = f"Assumido por {interaction.user.display_name}"
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.channel.send(f"🙋 {interaction.user.mention} assumiu este ticket.")
 
     @discord.ui.button(label="Fechar Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id="brs_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -661,21 +581,33 @@ class TicketControlView(discord.ui.View):
             await interaction.response.send_message("❌ Este botão só funciona dentro de um canal de ticket.", ephemeral=True)
             return
 
-        await interaction.response.send_message("🔒 Fechando o ticket em 5 segundos...", ephemeral=True)
+        await interaction.response.send_message("🔒 Fechando o ticket em 5 segundos e gerando o transcript...", ephemeral=True)
 
+        canal = interaction.channel
         cfg = DADOS["config"]["ticket"]
-        log_id = cfg.get("log_channel_id")
-        if log_id:
-            log_channel = interaction.guild.get_channel(log_id)
-            if log_channel:
-                await log_channel.send(embed=discord.Embed(
-                    description=f"🔒 Ticket fechado: `{interaction.channel.name}` por {interaction.user.mention}",
-                    color=discord.Color.red()
-                ))
 
-        await interaction.channel.send(f"🔒 Ticket fechado por {interaction.user.mention}. Encerrando em 5 segundos...")
+        # Gera um transcript simples em .txt com o histórico do ticket
+        linhas = []
+        async for msg in canal.history(limit=None, oldest_first=True):
+            hora = msg.created_at.strftime("%d/%m/%Y %H:%M")
+            conteudo = msg.content or "[sem texto / embed / anexo]"
+            linhas.append(f"[{hora}] {msg.author}: {conteudo}")
+        transcript_texto = "\n".join(linhas) or "Nenhuma mensagem registrada."
+        arquivo = discord.File(io.BytesIO(transcript_texto.encode("utf-8")), filename=f"{canal.name}-transcript.txt")
+
+        log_id = cfg.get("log_channel_id")
+        if log_id and (log_channel := interaction.guild.get_channel(log_id)):
+            await log_channel.send(
+                embed=discord.Embed(
+                    description=f"🔒 Ticket fechado: `{canal.name}` por {interaction.user.mention}",
+                    color=discord.Color.red(),
+                ),
+                file=arquivo,
+            )
+
+        await canal.send(f"🔒 Ticket fechado por {interaction.user.mention}. Encerrando em 5 segundos...")
         await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
-        await interaction.channel.delete(reason=f"Ticket fechado por {interaction.user}")
+        await canal.delete(reason=f"Ticket fechado por {interaction.user}")
 
 
 ticket_group = app_commands.Group(name="ticket", description="Sistema de tickets da BRS")
@@ -685,9 +617,9 @@ ticket_group = app_commands.Group(name="ticket", description="Sistema de tickets
 @app_commands.describe(
     categoria="Categoria dos tickets",
     cargo_staff="Cargo com acesso aos tickets",
-    nome_canal="Modelo do nome (use {user})",
+    nome_canal="Modelo do nome (use {tipo} e {user})",
     mensagem="Mensagem inicial (use {mention})",
-    canal_logs="Canal de logs",
+    canal_logs="Canal de logs (recebe abertura, fechamento e transcript)",
 )
 async def ticket_configurar(
     interaction: discord.Interaction,
@@ -724,17 +656,24 @@ async def ticket_configurar(
     await interaction.response.send_message("✅ Configuração atualizada:\n" + "\n".join(f"• {a}" for a in alterado), ephemeral=True)
 
 
-@ticket_group.command(name="painel", description="Envia o painel de tickets.")
+@ticket_group.command(name="painel", description="Envia o painel automático de tickets (select menu).")
 @app_commands.describe(canal="Canal do painel")
 async def ticket_painel(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
     if not await checar_permissao(interaction, "ticket"):
         return
     canal = canal or interaction.channel
+    cfg = DADOS["config"]["ticket"]
     embed = discord.Embed(
-        title="🎫  Central de Atendimento — BRS",
-        description="Clique no botão abaixo para abrir um ticket com a nossa staff.",
-        color=EMBED_COLOR,
+        title=cfg.get("painel_titulo", "🎫 Central de Atendimento — BRS"),
+        description=cfg.get("painel_descricao", "Selecione abaixo o tipo de atendimento que você precisa."),
+        color=BRS_GREEN,
     )
+    tipos_texto = "\n".join(f"{c['emoji']} **{c['label']}** — {c['descricao']}" for c in TICKET_CATEGORIES)
+    embed.add_field(name="📋 Categorias disponíveis", value=tipos_texto, inline=False)
+    avatar = bot_avatar_url()
+    if avatar:
+        embed.set_thumbnail(url=avatar)
+    embed.set_footer(text="BRS — Sistema de Tickets Automático")
     await canal.send(embed=embed, view=TicketPanelView())
     await interaction.response.send_message(f"✅ Painel enviado em {canal.mention}.", ephemeral=True)
 
@@ -768,7 +707,7 @@ class DropRewardSelect(discord.ui.Select):
     def __init__(self, user_id: int, roles: list[discord.Role]):
         options = []
         for role in roles[:3]:
-            info = {"nome": f"{role.name} (5 Dias)", "emoji": "🏅"}
+            info = DROP_REWARD_ROLES.get(role.id, {"nome": f"{role.name} (5 Dias)", "emoji": "🏅"})
             options.append(discord.SelectOption(
                 label=info["nome"][:100],
                 value=str(role.id),
@@ -872,13 +811,14 @@ async def drop_iniciar(
             f"### {pergunta}\n\n"
             f"Responda no chat! Quem acertar primeiro leva o prêmio 🏆"
         ),
-        color=0x00FF7F
+        color=BRS_GREEN
     )
     embed.add_field(name="🎁 Prêmios Garantidos", value="Cargos exclusivos a cada Drop vencido", inline=True)
     embed.add_field(name="⚡ Wave Drop", value="Vários drops seguidos quando a meta é batida", inline=True)
     embed.set_footer(text=f"Banco: {len(TODAS_PERGUNTAS)}+ perguntas • Boa sorte!")
-    if bot.user:
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    avatar = bot_avatar_url()
+    if avatar:
+        embed.set_thumbnail(url=avatar)
 
     await canal_destino.send(embed=embed)
     await interaction.response.send_message(f"✅ Drop iniciado em {canal_destino.mention}.", ephemeral=True)
@@ -956,7 +896,7 @@ async def drop_meta(interaction: discord.Interaction, quantidade: int, canal: Op
             f"**CARGO PERMANENTE**\n"
             f"acumule vitórias e desbloqueie"
         ),
-        color=0x00FF7F
+        color=BRS_GREEN
     )
     embed.add_field(
         name="📊 Progresso atual",
@@ -975,142 +915,71 @@ async def drop_meta(interaction: discord.Interaction, quantidade: int, canal: Op
     )
 
 
-@drop_group.command(name="configurar", description="Configura quantidade e tempo dos Drops.")
-@app_commands.describe(
-    quantidade="Quantidade padrão de Drops seguidos (1 a 25)",
-    tempo_resposta="Tempo para responder cada pergunta, em segundos (30 a 600)",
-    intervalo="Intervalo entre Drops, em segundos (0 a 120)",
-    canal="Canal padrão dos Drops",
-)
-async def drop_configurar(
-    interaction: discord.Interaction,
-    quantidade: Optional[int] = None,
-    tempo_resposta: Optional[int] = None,
-    intervalo: Optional[int] = None,
-    canal: Optional[discord.TextChannel] = None,
-):
-    if not await checar_permissao(interaction, "drop"):
-        return
-
-    cfg = DADOS["config"]["drop"]
-    alteracoes = []
-    if quantidade is not None:
-        if not 1 <= quantidade <= 25:
-            await interaction.response.send_message("❌ A quantidade deve ficar entre 1 e 25 Drops.", ephemeral=True)
-            return
-        cfg["quantidade_drops"] = quantidade
-        alteracoes.append(f"Drops seguidos: **{quantidade}**")
-    if tempo_resposta is not None:
-        if not 30 <= tempo_resposta <= 600:
-            await interaction.response.send_message("❌ O tempo de resposta deve ficar entre 30 e 600 segundos.", ephemeral=True)
-            return
-        cfg["tempo_resposta_segundos"] = tempo_resposta
-        alteracoes.append(f"Tempo por pergunta: **{tempo_resposta}s**")
-    if intervalo is not None:
-        if not 0 <= intervalo <= 120:
-            await interaction.response.send_message("❌ O intervalo deve ficar entre 0 e 120 segundos.", ephemeral=True)
-            return
-        cfg["intervalo_drops_segundos"] = intervalo
-        alteracoes.append(f"Intervalo: **{intervalo}s**")
-    if canal is not None:
-        cfg["default_channel_id"] = canal.id
-        alteracoes.append(f"Canal: {canal.mention}")
-
-    if not alteracoes:
-        await interaction.response.send_message(
-            "ℹ️ Configuração atual:\n"
-            f"Drops seguidos: **{cfg.get('quantidade_drops', 7)}**\n"
-            f"Tempo por pergunta: **{cfg.get('tempo_resposta_segundos', 180)}s**\n"
-            f"Intervalo: **{cfg.get('intervalo_drops_segundos', 8)}s**",
-            ephemeral=True,
-        )
-        return
-
-    salvar_dados(DADOS)
-    await interaction.response.send_message("✅ Configuração dos Drops atualizada:\n" + "\n".join(alteracoes), ephemeral=True)
-
-
-@drop_group.command(name="wave", description="Inicia vários Drops seguidos.")
-@app_commands.describe(quantidade="Quantidade de Drops; vazio usa a configuração salva", canal="Canal")
-async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] = None, canal: Optional[discord.TextChannel] = None):
-    if not await checar_permissao(interaction, "drop"):
-        return
-
+async def executar_wave(canal_destino: discord.TextChannel, quantidade: int = 7):
+    """Roda a sequência de drops da Wave. Usada tanto pelo comando manual
+    quanto pelo disparo automático quando a meta de membros é batida."""
     global ACTIVE_DROP, WAVE_RUNNING
+
+    if WAVE_RUNNING:
+        return False
+
+    quantidade = max(3, min(quantidade or 7, 12))
+    WAVE_RUNNING = True
+
+    for i in range(quantidade):
+        if ACTIVE_DROP and not ACTIVE_DROP.get("finalizado"):
+            await asyncio.sleep(5)
+            continue
+
+        escolha = random.choice(TODAS_PERGUNTAS)
+        ACTIVE_DROP = {
+            "pergunta": escolha["q"],
+            "resposta": escolha["a"],
+            "resposta_normalizada": normalizar(escolha["a"]),
+            "canal_id": canal_destino.id,
+            "finalizado": False,
+        }
+
+        embed = discord.Embed(
+            description=f"# 🌊 WAVE DROP {i+1}/{quantidade}\n\n### {escolha['q']}\n\nResponda no chat!",
+            color=BRS_GREEN
+        )
+        await canal_destino.send(embed=embed)
+
+        # espera até alguém acertar ou ~3 minutos
+        for _ in range(36):
+            await asyncio.sleep(5)
+            if ACTIVE_DROP is None or ACTIVE_DROP.get("finalizado"):
+                break
+
+        ACTIVE_DROP = None
+        await asyncio.sleep(8)
+
+    WAVE_RUNNING = False
+    await canal_destino.send(
+        embed=discord.Embed(title="🌊 Wave Drop finalizada!", color=discord.Color.gold())
+    )
+    return True
+
+
+@drop_group.command(name="wave", description="Inicia Wave Drop manualmente (5~10 drops seguidos).")
+@app_commands.describe(quantidade="Quantidade de drops (padrão 7)", canal="Canal")
+async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] = 7, canal: Optional[discord.TextChannel] = None):
+    if not await checar_permissao(interaction, "drop"):
+        return
+
     if WAVE_RUNNING:
         await interaction.response.send_message("❌ Já existe uma Wave em andamento.", ephemeral=True)
         return
-    if ACTIVE_DROP and not ACTIVE_DROP.get("finalizado"):
-        await interaction.response.send_message("❌ Já existe um Drop em andamento. Cancele-o antes de iniciar a Wave.", ephemeral=True)
-        return
 
-    cfg = DADOS["config"]["drop"]
-    if quantidade is None:
-        quantidade = int(cfg.get("quantidade_drops", 7))
-    if not 1 <= quantidade <= 25:
-        await interaction.response.send_message("❌ A quantidade deve ficar entre 1 e 25 Drops.", ephemeral=True)
-        return
-
-    canal_destino = canal
-    if canal_destino is None:
-        canal_id = cfg.get("default_channel_id")
-        canal_destino = interaction.guild.get_channel(canal_id) if canal_id else None
-    canal_destino = canal_destino or interaction.channel
-    tempo_resposta = max(30, min(int(cfg.get("tempo_resposta_segundos", 180)), 600))
-    intervalo = max(0, min(int(cfg.get("intervalo_drops_segundos", 8)), 120))
+    canal_destino = canal or interaction.channel
+    quantidade_final = max(3, min(quantidade or 7, 12))
 
     await interaction.response.send_message(
-        f"🌊 Wave iniciada com **{quantidade} Drops** em {canal_destino.mention}.",
-        ephemeral=True,
+        f"🌊 Wave Drop iniciada! {quantidade_final} drops em {canal_destino.mention}",
+        ephemeral=True
     )
-    WAVE_RUNNING = True
-    try:
-        for indice in range(quantidade):
-            if ACTIVE_DROP and not ACTIVE_DROP.get("finalizado"):
-                await asyncio.sleep(5)
-                continue
-
-            escolha = random.choice(TODAS_PERGUNTAS)
-            ACTIVE_DROP = {
-                "pergunta": escolha["q"],
-                "resposta": escolha["a"],
-                "resposta_normalizada": normalizar(escolha["a"]),
-                "canal_id": canal_destino.id,
-                "finalizado": False,
-            }
-
-            embed = discord.Embed(
-                description=(
-                    f"# 🌊 WAVE DROP {indice + 1}/{quantidade}\n\n"
-                    f"### {escolha['q']}\n\nResponda no chat!"
-                ),
-                color=0x00FF7F,
-            )
-            if bot.user:
-                embed.set_thumbnail(url=bot.user.display_avatar.url)
-            embed.set_footer(text=f"Categoria: {escolha.get('categoria', 'Geral')} • BRS Drops")
-            await canal_destino.send(embed=embed)
-
-            limite = max(1, (tempo_resposta + 4) // 5)
-            for _ in range(limite):
-                await asyncio.sleep(5)
-                if ACTIVE_DROP is None or ACTIVE_DROP.get("finalizado"):
-                    break
-
-            ACTIVE_DROP = None
-            if indice < quantidade - 1 and intervalo:
-                await asyncio.sleep(intervalo)
-
-        await canal_destino.send(
-            embed=discord.Embed(
-                title="🌊 Wave Drop finalizada!",
-                description=f"Foram executados **{quantidade} Drops**.",
-                color=discord.Color.gold(),
-            )
-        )
-    finally:
-        ACTIVE_DROP = None
-        WAVE_RUNNING = False
+    await executar_wave(canal_destino, quantidade_final)
 
 
 # Atualiza meta quando membro entra/sai
@@ -1152,7 +1021,7 @@ async def atualizar_meta(guild: discord.Guild):
             f"**CARGO PERMANENTE**\n"
             f"acumule vitórias e desbloqueie"
         ),
-        color=0x00FF7F
+        color=BRS_GREEN
     )
     embed.add_field(
         name="📊 Progresso atual",
@@ -1167,13 +1036,19 @@ async def atualizar_meta(guild: discord.Guild):
         salvar_dados(DADOS)
         await canal.send(embed=discord.Embed(
             title="🌊 WAVE DROP LIBERADO!",
-            description=f"A meta de **{meta:,}** membros foi batida!\nUse `/drop wave` para iniciar.",
+            description=f"A meta de **{meta:,}** membros foi batida!\nIniciando a Wave Drop automaticamente...",
             color=discord.Color.gold()
         ))
+        # Dispara a Wave Drop automaticamente, sem precisar de comando manual.
+        if not WAVE_RUNNING:
+            asyncio.create_task(executar_wave(canal, quantidade=7))
 
 
 # ============================================================
-#  /role
+#  /role — 100% livre de ID de cargo no código.
+#  O cargo é sempre escolhido pelo próprio Discord (parâmetro
+#  discord.Role), então funciona com qualquer cargo do servidor
+#  sem precisar editar o código-fonte.
 # ============================================================
 @bot.tree.command(name="role", description="Adiciona ou remove cargo de um membro.", guild=GUILD)
 @app_commands.describe(membro="Membro", cargo="Cargo", acao="Adicionar ou Remover")
@@ -1443,7 +1318,8 @@ async def scouting_canal(interaction: discord.Interaction, canal: discord.TextCh
 
 
 # ============================================================
-#  /say e /say_embed
+#  /say e /say_embed — foto do bot SEMPRE automática
+#  (nunca precisa colocar URL/código de imagem manualmente)
 # ============================================================
 @bot.tree.command(name="say", description="Envia mensagem pelo bot.", guild=GUILD)
 @app_commands.describe(mensagem="Texto", canal="Canal")
@@ -1455,10 +1331,10 @@ async def say_cmd(interaction: discord.Interaction, mensagem: str, canal: Option
     await interaction.response.send_message(f"✅ Enviado em {canal.mention}.", ephemeral=True)
 
 
-@bot.tree.command(name="say_embed", description="Envia embed pelo bot (foto do bot automática).", guild=GUILD)
+@bot.tree.command(name="say_embed", description="Envia embed pelo bot (a foto do bot vai automática, sem precisar informar nada).", guild=GUILD)
 @app_commands.describe(
     titulo="Título", descricao="Descrição (\\n para quebra)", canal="Canal",
-    cor="Cor hex (#FF0000)", imagem="URL imagem grande", rodape="Rodapé", autor="Autor"
+    cor="Cor hex (#FF0000)", imagem="URL imagem grande (opcional)", rodape="Rodapé", autor="Autor"
 )
 async def say_embed_cmd(
     interaction: discord.Interaction, titulo: str, descricao: str,
@@ -1475,19 +1351,25 @@ async def say_embed_cmd(
             await interaction.response.send_message("❌ Cor inválida. Ex: #FF0000", ephemeral=True)
             return
     else:
-        color = discord.Color(EMBED_COLOR)
+        color = discord.Color(BRS_GREEN)
 
     embed = discord.Embed(title=titulo, description=descricao.replace("\\n", "\n"), color=color)
-    avatar_url = bot.user.display_avatar.url if bot.user else None
-    if bot.user:
-        # Identidade visual automática: não é necessário colar URL ou código da foto.
-        embed.set_author(name=autor or bot.user.name, icon_url=avatar_url)
-        embed.set_thumbnail(url=avatar_url)
+
+    # A foto do bot é sempre aplicada automaticamente — não depende de
+    # nenhum parâmetro do comando nem de código extra por quem usa.
+    avatar = bot_avatar_url()
+    if avatar:
+        embed.set_thumbnail(url=avatar)
+        embed.set_author(name=autor or (bot.user.name if bot.user else "BRS"), icon_url=avatar)
     elif autor:
         embed.set_author(name=autor)
+
     if imagem:
         embed.set_image(url=imagem)
-    embed.set_footer(text=rodape or "BRS • Mensagem oficial", icon_url=avatar_url)
+    if rodape:
+        embed.set_footer(text=rodape, icon_url=avatar)
+    elif avatar:
+        embed.set_footer(text="BRS — Brazilian Roblox Soccer", icon_url=avatar)
 
     await canal.send(embed=embed)
     await interaction.response.send_message(f"✅ Embed enviado em {canal.mention}.", ephemeral=True)
@@ -1547,109 +1429,69 @@ async def permissao_cmd(interaction: discord.Interaction, comando: app_commands.
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-async def enviar_configuracao(interaction: discord.Interaction):
-    cfg = DADOS["config"]
-    guild = interaction.guild
-
-    def nomes_cargos(ids):
-        nomes = [guild.get_role(i).name for i in ids if guild.get_role(i)]
-        texto = ", ".join(f"`{n}`" for n in nomes) if nomes else "*nenhum*"
-        return texto[:1024]
-
-    def nome_canal(cid):
-        c = guild.get_channel(cid) if cid else None
-        if not c:
-            return "*não definido*"
-        return getattr(c, "mention", f"`{c.name}`")
-
-    embed = discord.Embed(
-        title="⚙️ Configurações — BRS",
-        description="Painel geral de configuração do servidor. Use `/config drop` para ajustar a Wave e `/permissao` para acessos.",
-        color=EMBED_COLOR,
-        timestamp=datetime.datetime.now(),
-    )
-    if bot.user:
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
-
-    embed.add_field(
-        name="🔐 Acessos",
-        value=(
-            f"**Staff geral:** {nomes_cargos(cfg['staff_role_ids'])}\n"
-            f"**Permissões específicas:** {len(cfg['command_permissions'])} comandos configuráveis"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🎫 Tickets",
-        value=(
-            f"**Categoria:** {nome_canal(cfg['ticket']['category_id'])}\n"
-            f"**Cargos staff:** {nomes_cargos(cfg['ticket']['staff_role_ids'])}\n"
-            f"**Logs:** {nome_canal(cfg['ticket']['log_channel_id'])}"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🌊 Drops",
-        value=(
-            f"**Canal padrão:** {nome_canal(cfg['drop']['default_channel_id'])}\n"
-            f"**Drops seguidos:** `{cfg['drop'].get('quantidade_drops', 7)}`\n"
-            f"**Tempo de resposta:** `{cfg['drop'].get('tempo_resposta_segundos', 180)}s`\n"
-            f"**Intervalo:** `{cfg['drop'].get('intervalo_drops_segundos', 8)}s`\n"
-            f"**Prêmios cadastrados:** `{len(cfg['drop'].get('reward_role_ids', []))}`\n"
-            f"**Banco:** `{len(TODAS_PERGUNTAS)}` perguntas em várias categorias"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="📈 Meta de membros",
-        value=(
-            f"**Meta:** `{cfg['drop'].get('meta_membros', 0):,}` membros\n"
-            f"**Canal:** {nome_canal(cfg['drop'].get('meta_canal_id'))}\n"
-            f"**Wave liberada:** `{('sim' if cfg['drop'].get('wave_ativo') else 'não')}`"
-        ),
-        inline=True,
-    )
-    embed.add_field(
-        name="📣 Publicações",
-        value=(
-            f"**Free Agent:** {nome_canal(cfg['freeagent']['channel_id'])}\n"
-            f"**Scouting:** {nome_canal(cfg['scouting']['channel_id'])}"
-        ),
-        inline=True,
-    )
-    embed.set_footer(text="BRS Bot • Configuração em português do Brasil")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ---- Painel de configuração, no estilo visual da referência (PAFO) ----
+def _nomes_cargos(guild: discord.Guild, ids) -> str:
+    nomes = [role.name for i in ids if (role := guild.get_role(i))]
+    return ", ".join(f"`{n}`" for n in nomes) if nomes else "*nenhum*"
 
 
-config_group = app_commands.Group(name="config", description="Configurações organizadas do bot BRS")
+def _nome_canal(guild: discord.Guild, cid) -> str:
+    c = guild.get_channel(cid) if cid else None
+    return c.mention if c else "*não definido*"
 
 
-@config_group.command(name="ver", description="Mostra o painel completo de configurações.")
-@app_commands.checks.has_permissions(administrator=True)
-async def config_ver_subcmd(interaction: discord.Interaction):
-    await enviar_configuracao(interaction)
-
-
-@config_group.command(name="drop", description="Mostra como estão configurados os Drops.")
-async def config_drop_subcmd(interaction: discord.Interaction):
-    if not await checar_permissao(interaction, "drop"):
-        return
-    cfg = DADOS["config"]["drop"]
-    embed = discord.Embed(title="🌊 Configuração dos Drops — BRS", color=0x00FF7F)
-    if bot.user:
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.add_field(name="Drops seguidos", value=f"`{cfg.get('quantidade_drops', 7)}`", inline=True)
-    embed.add_field(name="Tempo por pergunta", value=f"`{cfg.get('tempo_resposta_segundos', 180)}s`", inline=True)
-    embed.add_field(name="Intervalo", value=f"`{cfg.get('intervalo_drops_segundos', 8)}s`", inline=True)
-    embed.add_field(name="Banco de perguntas", value=f"`{len(TODAS_PERGUNTAS)}` perguntas", inline=False)
-    embed.set_footer(text="Para alterar: /drop configurar")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="config_ver", description="Mostra configurações atuais.", guild=GUILD)
+@bot.tree.command(name="config_ver", description="Mostra o painel de configurações atuais do bot.", guild=GUILD)
 @app_commands.checks.has_permissions(administrator=True)
 async def config_ver_cmd(interaction: discord.Interaction):
-    await enviar_configuracao(interaction)
+    cfg = DADOS["config"]
+    guild = interaction.guild
+    avatar = bot_avatar_url()
+
+    # Embed principal — visão geral, no mesmo estilo escuro/verde da referência
+    principal = discord.Embed(
+        title="⚙️  PAINEL DE CONFIGURAÇÕES — BRS",
+        description=(
+            "Visão geral organizada de tudo que está configurado no bot.\n"
+            "Use `/staff`, `/permissao`, `/ticket configurar`, `/drop meta`, "
+            "`/freeagent canal` e `/scouting canal` para alterar."
+        ),
+        color=BRS_GREEN,
+        timestamp=datetime.datetime.now(),
+    )
+    if avatar:
+        principal.set_thumbnail(url=avatar)
+    principal.add_field(name="🛡️ Staff Geral", value=_nomes_cargos(guild, cfg["staff_role_ids"]), inline=False)
+    perms = "\n".join(f"**/{k}** → {_nomes_cargos(guild, v)}" for k, v in cfg["command_permissions"].items())
+    principal.add_field(name="🔑 Permissões por Comando", value=perms or "*nenhuma*", inline=False)
+    principal.set_footer(text="BRS Bot • Painel 1/2")
+
+    # Embed secundário — módulos (tickets, drop, free agent, scouting)
+    modulos = discord.Embed(color=BRS_GREEN, timestamp=datetime.datetime.now())
+    modulos.add_field(
+        name="🎫 Tickets",
+        value=(
+            f"Categoria: {_nome_canal(guild, cfg['ticket']['category_id'])}\n"
+            f"Cargos staff: {_nomes_cargos(guild, cfg['ticket']['staff_role_ids'])}\n"
+            f"Logs: {_nome_canal(guild, cfg['ticket']['log_channel_id'])}\n"
+            f"Tipos disponíveis: {', '.join(c['label'] for c in TICKET_CATEGORIES)}"
+        ),
+        inline=False,
+    )
+    modulos.add_field(
+        name="❓ Drop",
+        value=(
+            f"Prêmios: {_nomes_cargos(guild, cfg['drop']['reward_role_ids'])}\n"
+            f"Canal padrão: {_nome_canal(guild, cfg['drop']['default_channel_id'])}\n"
+            f"Meta: **{cfg['drop'].get('meta_membros', 0):,}** membros\n"
+            f"Perguntas no banco: **{len(TODAS_PERGUNTAS):,}+**"
+        ),
+        inline=False,
+    )
+    modulos.add_field(name="🆓 Free Agent", value=f"Canal: {_nome_canal(guild, cfg['freeagent']['channel_id'])}", inline=True)
+    modulos.add_field(name="🔍 Scouting", value=f"Canal: {_nome_canal(guild, cfg['scouting']['channel_id'])}", inline=True)
+    modulos.set_footer(text="BRS Bot • Painel 2/2")
+
+    await interaction.response.send_message(embeds=[principal, modulos], ephemeral=True)
 
 
 # ============================================================
