@@ -218,7 +218,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    global ACTIVE_DROP, WAVE_RUNNING
+    global ACTIVE_DROP
 
     if message.author.bot:
         return
@@ -683,7 +683,9 @@ async def drop_meta(interaction: discord.Interaction, quantidade: int, canal: Op
 async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] = 7, canal: Optional[discord.TextChannel] = None):
     if not await checar_permissao(interaction, "drop"):
         return
-    global WAVE_RUNNING
+
+    global ACTIVE_DROP, WAVE_RUNNING
+
     if WAVE_RUNNING:
         await interaction.response.send_message("❌ Já existe uma Wave em andamento.", ephemeral=True)
         return
@@ -691,15 +693,18 @@ async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] 
     canal_destino = canal or interaction.channel
     quantidade = max(3, min(quantidade or 7, 12))
 
-    await interaction.response.send_message(f"🌊 Wave Drop iniciada! {quantidade} drops em {canal_destino.mention}", ephemeral=True)
+    await interaction.response.send_message(
+        f"🌊 Wave Drop iniciada! {quantidade} drops em {canal_destino.mention}",
+        ephemeral=True
+    )
     WAVE_RUNNING = True
 
     for i in range(quantidade):
         if ACTIVE_DROP and not ACTIVE_DROP.get("finalizado"):
             await asyncio.sleep(5)
             continue
+
         escolha = random.choice(TODAS_PERGUNTAS)
-        global ACTIVE_DROP
         ACTIVE_DROP = {
             "pergunta": escolha["q"],
             "resposta": escolha["a"],
@@ -707,21 +712,26 @@ async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] 
             "canal_id": canal_destino.id,
             "finalizado": False,
         }
+
         embed = discord.Embed(
             description=f"# 🌊 WAVE DROP {i+1}/{quantidade}\n\n### {escolha['q']}\n\nResponda no chat!",
             color=0x00FF7F
         )
         await canal_destino.send(embed=embed)
-        # espera até alguém acertar ou 3 minutos
+
+        # espera até alguém acertar ou \~3 minutos
         for _ in range(36):
             await asyncio.sleep(5)
             if ACTIVE_DROP is None or ACTIVE_DROP.get("finalizado"):
                 break
+
         ACTIVE_DROP = None
         await asyncio.sleep(8)
 
     WAVE_RUNNING = False
-    await canal_destino.send(embed=discord.Embed(title="🌊 Wave Drop finalizada!", color=discord.Color.gold()))
+    await canal_destino.send(
+        embed=discord.Embed(title="🌊 Wave Drop finalizada!", color=discord.Color.gold())
+    )
 
 
 # Atualiza meta quando membro entra/sai
@@ -896,7 +906,11 @@ async def freeagent_lista(interaction: discord.Interaction):
     if not itens:
         await interaction.response.send_message("ℹ️ Nenhum Free Agent cadastrado.", ephemeral=True)
         return
-    linhas = [f"▸ {(interaction.guild.get_member(int(jid)) or discord.Object(id=int(jid))).mention if False else (m.mention if (m := interaction.guild.get_member(int(jid))) else f'<@{jid}>')} — `{dj['posicao']}`" for jid, dj in itens.items()]
+    linhas = []
+    for jid, dj in itens.items():
+        m = interaction.guild.get_member(int(jid))
+        nome = m.mention if m else f"<@{jid}>"
+        linhas.append(f"▸ {nome} — `{dj['posicao']}`")
     embed = discord.Embed(title="🆓 FREE AGENTS — BRS", description="\n".join(linhas), color=discord.Color.from_rgb(52, 152, 219))
     embed.set_footer(text=f"Total: {len(itens)}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
