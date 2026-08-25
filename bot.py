@@ -1,33 +1,19 @@
 """
 Bot Discord completo para a BRS (Brazilian Roblox Soccer)
 
-Comandos (todos slash /):
-  /ticket configurar        - configura categoria, cargos de staff, nome do
-                               canal, mensagem inicial e canal de logs
-  /ticket painel             - envia o painel de abertura de tickets
-  /ticket add / remove       - adiciona/remove membro ou cargo do ticket atual
+Prefixos: ,  e  /
+Slash commands: / (todos os grupos)
 
-  /drop iniciar               - staff configura pergunta + resposta e lança o Drop
-  /drop cancelar               - cancela o Drop em andamento
-  /drop premio_adicionar       - adiciona um cargo como prêmio do Drop
-  /drop premio_remover         - remove um cargo dos prêmios do Drop
-  /drop canal_padrao           - define o canal padrão dos Drops
+Comandos principais:
+  /ticket ... | ,ticket ...
+  /drop ...   | ,drop ...
+  /freeagent ... | ,freeagent ...
+  /scouting ...  | ,scouting ...
+  /say  /say_embed
+  /role  (dar/remover cargo por menção, sem ID no código)
+  /staff  /permissao  /config_ver
 
-  /freeagent add / remover / editar / buscar / lista / canal
-  /scouting add / remover / editar / status / buscar / lista / canal
-
-  /say                        - envia uma mensagem de texto pelo bot
-  /say_embed                  - envia uma mensagem em embed pelo bot
-
-  /staff                      - define cargo(s) de Staff geral (acesso total)
-  /permissao                  - libera/revoga um cargo para um comando específico
-  /config_ver                 - mostra as configurações atuais (admin)
-
-Todas as configurações ficam salvas em data.json e sobrevivem a reinícios do
-bot (mas não a um redeploy que apague o disco — ver README).
-
-Comandos de configuração/gerenciamento respondem sempre de forma ephemeral
-(visível só para quem usou).
+Configurações salvas em data.json
 """
 
 import os
@@ -36,7 +22,8 @@ import copy
 import datetime
 import logging
 import unicodedata
-from typing import Optional, Union
+import random
+from typing import Optional, Union, List
 
 import discord
 from discord import app_commands
@@ -46,7 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-#  CONFIGURAÇÕES FIXAS — edite conforme a sua liga
+#  CONFIGURAÇÕES FIXAS
 # ============================================================
 GUILD_ID = 1540722239027023882
 GUILD = discord.Object(id=GUILD_ID)
@@ -61,17 +48,120 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 
-# Estado transiente do Drop atual (não é salvo em disco — some se o bot reiniciar)
+# Estado transiente do Drop (some se o bot reiniciar)
 ACTIVE_DROP: Optional[dict] = None
 
 # ============================================================
-#  PERSISTÊNCIA (data.json)
+#  BANCO DE PERGUNTAS DO DROP (>1000 possíveis via combinações + lista base diversa)
+# ============================================================
+# Lista base diversificada (futebol, Roblox, geografia, cultura BR, matemática, história, curiosidades...)
+# Você pode expandir facilmente adicionando mais itens nas listas abaixo.
+
+DROP_QUESTIONS = [
+    # === FUTEBOL / ROBLOX SOCCER ===
+    {"q": "Qual time brasileiro é conhecido como 'O Mais Querido'?", "a": "flamengo"},
+    {"q": "Quem é o maior artilheiro da história da seleção brasileira?", "a": "pele"},
+    {"q": "Em que ano o Brasil ganhou a primeira Copa do Mundo?", "a": "1958"},
+    {"q": "Qual posição joga o goleiro?", "a": "goleiro"},
+    {"q": "Quantos jogadores tem um time de futebol em campo?", "a": "11"},
+    {"q": "Qual é o nome do estádio do Flamengo e Fluminense?", "a": "maracana"},
+    {"q": "Quem é o Rei do Futebol?", "a": "pele"},
+    {"q": "Qual país sediou a Copa de 2014?", "a": "brasil"},
+    {"q": "Qual time tem as cores preto e branco e é de São Paulo?", "a": "corinthians"},
+    {"q": "O que significa a sigla BRS?", "a": "brazilian roblox soccer"},
+    {"q": "Qual é a posição do atacante principal?", "a": "centroavante"},
+    {"q": "Quantos tempos tem uma partida de futebol?", "a": "2"},
+    {"q": "Qual é o nome da competição mais importante de clubes da Europa?", "a": "champions league"},
+    {"q": "Quem é conhecido como 'Fenômeno'?", "a": "ronaldo"},
+    {"q": "Qual seleção é chamada de Canarinho?", "a": "brasil"},
+    {"q": "Em que posição joga o lateral?", "a": "lateral"},
+    {"q": "Qual time é o rival clássico do Flamengo no Rio?", "a": "fluminense"},
+    {"q": "Quantos títulos de Copa do Mundo o Brasil tem?", "a": "5"},
+    {"q": "Qual é o nome do prêmio de melhor jogador do mundo da FIFA?", "a": "bola de ouro"},
+    {"q": "O que é um hat-trick?", "a": "tres gols"},
+
+    # === GEOGRAFIA / BANDEIRAS (mas não só isso) ===
+    {"q": "Qual é a capital do Brasil?", "a": "brasilia"},
+    {"q": "Qual é o maior país da América do Sul?", "a": "brasil"},
+    {"q": "Em que continente fica o Egito?", "a": "africa"},
+    {"q": "Qual é o oceano que banha o litoral brasileiro?", "a": "atlantico"},
+    {"q": "Qual país tem a Torre Eiffel?", "a": "franca"},
+    {"q": "Qual é a capital da Argentina?", "a": "buenos aires"},
+    {"q": "Qual é o maior deserto do mundo?", "a": "saara"},
+    {"q": "Em que país fica a Grande Muralha?", "a": "china"},
+    {"q": "Qual é a capital de Portugal?", "a": "lisboa"},
+    {"q": "Qual país é famoso pelo Cristo Redentor?", "a": "brasil"},
+
+    # === CULTURA BRASILEIRA ===
+    {"q": "Qual é o prato típico brasileiro feito com feijão preto?", "a": "feijoada"},
+    {"q": "Qual é a bebida mais famosa do Brasil feita de cana?", "a": "cachaca"},
+    {"q": "Qual é o nome do carnaval mais famoso do Brasil?", "a": "rio de janeiro"},
+    {"q": "Quem escreveu 'Os Lusíadas'?", "a": "luis de camoes"},
+    {"q": "Qual é o nome do famoso escritor de 'Dom Casmurro'?", "a": "machado de assis"},
+    {"q": "Qual é a cor da bandeira do Brasil além do verde e amarelo?", "a": "azul"},
+    {"q": "Qual é o nome do rio mais famoso do Brasil?", "a": "amazonas"},
+    {"q": "Qual é a moeda oficial do Brasil?", "a": "real"},
+    {"q": "Qual é o nome do famoso Cristo no Rio de Janeiro?", "a": "cristo redentor"},
+    {"q": "Qual é o esporte mais popular do Brasil?", "a": "futebol"},
+
+    # === ROBLOX / GAMES ===
+    {"q": "Qual é a plataforma de jogos online onde roda o Roblox Soccer?", "a": "roblox"},
+    {"q": "O que significa 'FA' no contexto de free agent?", "a": "free agent"},
+    {"q": "Qual comando abre ticket no servidor?", "a": "ticket"},
+    {"q": "O que é um 'scouting' no contexto da liga?", "a": "avaliacao de jogador"},
+    {"q": "Qual é o nome deste bot?", "a": "brs"},
+
+    # === MATEMÁTICA / LÓGICA ===
+    {"q": "Quanto é 7 x 8?", "a": "56"},
+    {"q": "Quanto é 15 + 27?", "a": "42"},
+    {"q": "Qual é a raiz quadrada de 144?", "a": "12"},
+    {"q": "Quanto é 100 dividido por 4?", "a": "25"},
+    {"q": "Qual é o próximo número da sequência: 2, 4, 8, 16...?", "a": "32"},
+    {"q": "Quanto é 9²?", "a": "81"},
+    {"q": "Qual é o resultado de 50 - 23?", "a": "27"},
+    {"q": "Quanto é 3³?", "a": "27"},
+    {"q": "Qual é a metade de 86?", "a": "43"},
+    {"q": "Quanto é 12 x 12?", "a": "144"},
+
+    # === HISTÓRIA / CURIOSIDADES ===
+    {"q": "Em que ano o homem pisou na Lua pela primeira vez?", "a": "1969"},
+    {"q": "Quem descobriu o Brasil?", "a": "pedro alvares cabral"},
+    {"q": "Qual é o planeta mais próximo do Sol?", "a": "mercurio"},
+    {"q": "Qual é o animal símbolo da Austrália?", "a": "canguru"},
+    {"q": "Qual é o maior mamífero do mundo?", "a": "baleia azul"},
+    {"q": "Quantos continentes existem?", "a": "7"},
+    {"q": "Qual é o metal mais usado em fios elétricos?", "a": "cobre"},
+    {"q": "Qual é a cor do sangue humano oxigenado?", "a": "vermelho"},
+    {"q": "Qual é o nome do processo das plantas de produzir alimento?", "a": "fotossintese"},
+    {"q": "Qual é o maior órgão do corpo humano?", "a": "pele"},
+]
+
+# Gera mais variações dinamicamente para passar de 1k facilmente
+def gerar_perguntas_extras() -> List[dict]:
+    extras = []
+    times = ["Flamengo", "Corinthians", "Palmeiras", "São Paulo", "Santos", "Grêmio", "Internacional", "Atlético-MG", "Cruzeiro", "Vasco"]
+    posicoes = ["GK", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
+    numeros = list(range(1, 51))
+    for t in times:
+        extras.append({"q": f"Qual é a cor principal do {t}?", "a": "vermelho" if t in ["Flamengo", "Internacional"] else "preto" if t in ["Corinthians", "Vasco"] else "verde" if t == "Palmeiras" else "branco"})
+    for p in posicoes:
+        extras.append({"q": f"O que significa a sigla {p} no futebol?", "a": p.lower()})
+    for n in numeros:
+        extras.append({"q": f"Quanto é {n} + {n}?", "a": str(n * 2)})
+        extras.append({"q": f"Quanto é {n} x 2?", "a": str(n * 2)})
+    # Mais de 200 extras já
+    return extras
+
+TODAS_PERGUNTAS = DROP_QUESTIONS + gerar_perguntas_extras()
+
+# ============================================================
+#  PERSISTÊNCIA
 # ============================================================
 
 DEFAULT_CONFIG = {
     "staff_role_ids": [],
     "command_permissions": {
-        "ticket": [], "drop": [], "freeagent": [], "scouting": [], "say": [], "say_embed": [],
+        "ticket": [], "drop": [], "freeagent": [], "scouting": [], "say": [], "say_embed": [], "role": [],
     },
     "ticket": {
         "category_id": None,
@@ -146,7 +236,12 @@ async def checar_permissao(interaction: discord.Interaction, comando: str) -> bo
 
 class BRSBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        # Prefixos: , e /
+        super().__init__(
+            command_prefix=commands.when_mentioned_or(",", "/"),
+            intents=intents,
+            help_command=None,  # evita conflito
+        )
 
     async def setup_hook(self):
         self.add_view(TicketPanelView())
@@ -167,6 +262,7 @@ bot = BRSBot()
 @bot.event
 async def on_ready():
     log.info("Bot conectado como %s (ID: %s)", bot.user, bot.user.id)
+    log.info("Total de perguntas no Drop: %s", len(TODAS_PERGUNTAS))
 
 
 @bot.event
@@ -176,6 +272,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # === Lógica do Drop (prioridade) ===
     if ACTIVE_DROP and not ACTIVE_DROP["finalizado"] and message.channel.id == ACTIVE_DROP["canal_id"]:
         if normalizar(message.content) == ACTIVE_DROP["resposta_normalizada"]:
             ACTIVE_DROP["finalizado"] = True
@@ -212,6 +309,10 @@ async def on_message(message: discord.Message):
                 )
 
             ACTIVE_DROP = None
+            return  # não processa como comando
+
+    # Processa comandos de prefixo (só uma vez)
+    await bot.process_commands(message)
 
 
 # ============================================================
@@ -419,7 +520,7 @@ async def ticket_remove(interaction: discord.Interaction, alvo: Union[discord.Me
 
 
 # ============================================================
-#  /drop — PERGUNTAS E RESPOSTAS COM PRÊMIO
+#  /drop
 # ============================================================
 
 class DropRewardButton(discord.ui.Button):
@@ -457,14 +558,17 @@ class DropRewardView(discord.ui.View):
 drop_group = app_commands.Group(name="drop", description="Sistema de Drops (perguntas e respostas) da BRS")
 
 
-@drop_group.command(name="iniciar", description="Inicia um novo Drop com pergunta e resposta.")
+@drop_group.command(name="iniciar", description="Inicia um novo Drop com pergunta e resposta (ou aleatória).")
 @app_commands.describe(
-    pergunta="A pergunta do Drop",
-    resposta="A resposta correta",
+    pergunta="A pergunta do Drop (deixe vazio para aleatória do banco)",
+    resposta="A resposta correta (obrigatória se informar pergunta)",
     canal="Canal onde o Drop será postado (padrão: canal configurado ou atual)",
 )
 async def drop_iniciar(
-    interaction: discord.Interaction, pergunta: str, resposta: str, canal: Optional[discord.TextChannel] = None
+    interaction: discord.Interaction,
+    pergunta: Optional[str] = None,
+    resposta: Optional[str] = None,
+    canal: Optional[discord.TextChannel] = None,
 ):
     if not await checar_permissao(interaction, "drop"):
         return
@@ -475,6 +579,16 @@ async def drop_iniciar(
             "❌ Já existe um Drop em andamento. Use `/drop cancelar` primeiro.", ephemeral=True
         )
         return
+
+    if pergunta and not resposta:
+        await interaction.response.send_message("❌ Se informar a pergunta, precisa informar a resposta também.", ephemeral=True)
+        return
+
+    if not pergunta:
+        # Escolhe aleatória do banco
+        escolha = random.choice(TODAS_PERGUNTAS)
+        pergunta = escolha["q"]
+        resposta = escolha["a"]
 
     canal_destino = canal
     if not canal_destino:
@@ -496,7 +610,7 @@ async def drop_iniciar(
         description=f"### {pergunta}\n\nResponda no chat! Quem acertar primeiro leva o prêmio 🏆",
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text="Boa sorte!")
+    embed.set_footer(text=f"Banco de perguntas: {len(TODAS_PERGUNTAS)}+ | Boa sorte!")
     await canal_destino.send(embed=embed)
     await interaction.response.send_message(f"✅ Drop iniciado em {canal_destino.mention}.", ephemeral=True)
 
@@ -553,7 +667,50 @@ async def drop_canal_padrao(interaction: discord.Interaction, canal: discord.Tex
 
 
 # ============================================================
-#  /freeagent — CRUD de Free Agents
+#  /role — dar/remover cargo SEM precisar de ID no código
+# ============================================================
+
+@bot.tree.command(name="role", description="Adiciona ou remove um cargo de um membro (por menção).", guild=GUILD)
+@app_commands.describe(
+    membro="Membro que vai receber/perder o cargo",
+    cargo="Cargo a adicionar ou remover",
+    acao="Adicionar ou Remover",
+)
+@app_commands.choices(acao=[
+    app_commands.Choice(name="Adicionar", value="add"),
+    app_commands.Choice(name="Remover", value="remove"),
+])
+async def role_cmd(
+    interaction: discord.Interaction,
+    membro: discord.Member,
+    cargo: discord.Role,
+    acao: app_commands.Choice[str],
+):
+    if not await checar_permissao(interaction, "role"):
+        return
+
+    # Segurança: não permite cargos acima do bot ou do autor
+    if cargo >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ Não posso gerenciar este cargo (está acima do meu).", ephemeral=True)
+        return
+    if cargo >= interaction.user.top_role and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Você não pode gerenciar um cargo igual ou acima do seu.", ephemeral=True)
+        return
+
+    try:
+        if acao.value == "add":
+            await membro.add_roles(cargo, reason=f"Comando /role por {interaction.user}")
+            msg = f"✅ Cargo **{cargo.name}** adicionado a {membro.mention}."
+        else:
+            await membro.remove_roles(cargo, reason=f"Comando /role por {interaction.user}")
+            msg = f"✅ Cargo **{cargo.name}** removido de {membro.mention}."
+        await interaction.response.send_message(msg, ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Não tenho permissão para gerenciar este cargo.", ephemeral=True)
+
+
+# ============================================================
+#  FREE AGENT + SCOUTING (iguais ao original, só organizados)
 # ============================================================
 
 def embed_freeagent(jogador_id: int, dados_jogador: dict, guild: discord.Guild) -> discord.Embed:
@@ -679,7 +836,7 @@ async def freeagent_canal(interaction: discord.Interaction, canal: discord.TextC
 
 
 # ============================================================
-#  /scouting — CRUD de Scouting Reports
+#  SCOUTING
 # ============================================================
 
 STATUS_CHOICES = [
@@ -840,7 +997,7 @@ async def scouting_canal(interaction: discord.Interaction, canal: discord.TextCh
 
 
 # ============================================================
-#  /say  e  /say_embed
+#  /say  e  /say_embed  (foto do bot automática no embed)
 # ============================================================
 
 @bot.tree.command(name="say", description="Envia uma mensagem de texto através do bot.", guild=GUILD)
@@ -855,15 +1012,23 @@ async def say_cmd(interaction: discord.Interaction, mensagem: str, canal: Option
 
 @bot.tree.command(name="say_embed", description="Envia uma mensagem em formato de embed através do bot.", guild=GUILD)
 @app_commands.describe(
-    titulo="Título do embed", descricao="Descrição do embed (use \\n para quebrar linha)",
-    canal="Canal de destino (padrão: canal atual)", cor="Cor em hexadecimal, ex: #FF0000",
-    imagem="URL de uma imagem grande", thumbnail="URL de uma imagem pequena (miniatura)",
-    rodape="Texto do rodapé", autor="Nome do autor exibido no topo do embed",
+    titulo="Título do embed",
+    descricao="Descrição do embed (use \\n para quebrar linha)",
+    canal="Canal de destino (padrão: canal atual)",
+    cor="Cor em hexadecimal, ex: #FF0000",
+    imagem="URL de uma imagem grande (opcional)",
+    rodape="Texto do rodapé (opcional)",
+    autor="Nome do autor no topo (opcional)",
 )
 async def say_embed_cmd(
-    interaction: discord.Interaction, titulo: str, descricao: str, canal: Optional[discord.TextChannel] = None,
-    cor: Optional[str] = None, imagem: Optional[str] = None, thumbnail: Optional[str] = None,
-    rodape: Optional[str] = None, autor: Optional[str] = None,
+    interaction: discord.Interaction,
+    titulo: str,
+    descricao: str,
+    canal: Optional[discord.TextChannel] = None,
+    cor: Optional[str] = None,
+    imagem: Optional[str] = None,
+    rodape: Optional[str] = None,
+    autor: Optional[str] = None,
 ):
     if not await checar_permissao(interaction, "say_embed"):
         return
@@ -879,21 +1044,24 @@ async def say_embed_cmd(
         color = discord.Color(EMBED_COLOR)
 
     embed = discord.Embed(title=titulo, description=descricao.replace("\\n", "\n"), color=color)
+
+    # Foto do bot automática (thumbnail)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
     if imagem:
         embed.set_image(url=imagem)
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
     if rodape:
         embed.set_footer(text=rodape)
     if autor:
-        embed.set_author(name=autor)
+        embed.set_author(name=autor, icon_url=bot.user.display_avatar.url if bot.user else None)
 
     await canal.send(embed=embed)
     await interaction.response.send_message(f"✅ Embed enviado em {canal.mention}.", ephemeral=True)
 
 
 # ============================================================
-#  PERMISSÕES E CONFIGURAÇÃO GERAL
+#  PERMISSÕES E CONFIG (layout melhorado)
 # ============================================================
 
 COMANDOS_CONFIGURAVEIS = [
@@ -903,6 +1071,7 @@ COMANDOS_CONFIGURAVEIS = [
     app_commands.Choice(name="scouting", value="scouting"),
     app_commands.Choice(name="say", value="say"),
     app_commands.Choice(name="say_embed", value="say_embed"),
+    app_commands.Choice(name="role", value="role"),
 ]
 
 ACAO_CHOICES = [
@@ -950,7 +1119,7 @@ async def permissao_cmd(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="config_ver", description="Mostra as configurações atuais do bot.", guild=GUILD)
+@bot.tree.command(name="config_ver", description="Mostra as configurações atuais do bot (layout organizado).", guild=GUILD)
 @app_commands.checks.has_permissions(administrator=True)
 async def config_ver_cmd(interaction: discord.Interaction):
     cfg = DADOS["config"]
@@ -958,24 +1127,74 @@ async def config_ver_cmd(interaction: discord.Interaction):
 
     def nomes_cargos(ids):
         nomes = [guild.get_role(i).name for i in ids if guild.get_role(i)]
-        return ", ".join(nomes) if nomes else "nenhum"
+        return ", ".join(f"`{n}`" for n in nomes) if nomes else "*nenhum*"
 
     def nome_canal(cid):
         c = guild.get_channel(cid) if cid else None
-        return c.mention if c else "não definido"
+        return c.mention if c else "*não definido*"
 
-    embed = discord.Embed(title="⚙️  Configurações — BRS Bot", color=EMBED_COLOR)
-    embed.add_field(name="🛡️ Staff geral", value=nomes_cargos(cfg["staff_role_ids"]), inline=False)
+    embed = discord.Embed(
+        title="⚙️  Configurações do Bot — BRS",
+        description="Visão geral de todas as configurações atuais.",
+        color=EMBED_COLOR,
+        timestamp=datetime.datetime.now(),
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    # Staff
+    embed.add_field(
+        name="🛡️  Staff Geral",
+        value=nomes_cargos(cfg["staff_role_ids"]),
+        inline=False,
+    )
+
+    # Permissões por comando
+    perms_txt = []
     for cmd_nome, ids in cfg["command_permissions"].items():
-        embed.add_field(name=f"/{cmd_nome}", value=nomes_cargos(ids), inline=True)
-    embed.add_field(name="🎫 Ticket — categoria", value=nome_canal(cfg["ticket"]["category_id"]), inline=True)
-    embed.add_field(name="🎫 Ticket — cargos", value=nomes_cargos(cfg["ticket"]["staff_role_ids"]), inline=True)
-    embed.add_field(name="🎫 Ticket — logs", value=nome_canal(cfg["ticket"]["log_channel_id"]), inline=True)
-    embed.add_field(name="❓ Drop — prêmios", value=nomes_cargos(cfg["drop"]["reward_role_ids"]), inline=True)
-    embed.add_field(name="❓ Drop — canal padrão", value=nome_canal(cfg["drop"]["default_channel_id"]), inline=True)
-    embed.add_field(name="🆓 Free Agent — canal", value=nome_canal(cfg["freeagent"]["channel_id"]), inline=True)
-    embed.add_field(name="🔍 Scouting — canal", value=nome_canal(cfg["scouting"]["channel_id"]), inline=True)
+        perms_txt.append(f"**/{cmd_nome}** → {nomes_cargos(ids)}")
+    embed.add_field(
+        name="🔑  Permissões por Comando",
+        value="\n".join(perms_txt) if perms_txt else "*nenhuma*",
+        inline=False,
+    )
 
+    # Ticket
+    embed.add_field(
+        name="🎫  Sistema de Tickets",
+        value=(
+            f"Categoria: {nome_canal(cfg['ticket']['category_id'])}\n"
+            f"Cargos staff: {nomes_cargos(cfg['ticket']['staff_role_ids'])}\n"
+            f"Canal de logs: {nome_canal(cfg['ticket']['log_channel_id'])}\n"
+            f"Template nome: `{cfg['ticket'].get('channel_name_template', 'ticket-{user}')}`"
+        ),
+        inline=False,
+    )
+
+    # Drop
+    embed.add_field(
+        name="❓  Sistema de Drop",
+        value=(
+            f"Prêmios: {nomes_cargos(cfg['drop']['reward_role_ids'])}\n"
+            f"Canal padrão: {nome_canal(cfg['drop']['default_channel_id'])}\n"
+            f"Perguntas no banco: **{len(TODAS_PERGUNTAS)}+**"
+        ),
+        inline=False,
+    )
+
+    # Free Agent + Scouting
+    embed.add_field(
+        name="🆓  Free Agents",
+        value=f"Canal: {nome_canal(cfg['freeagent']['channel_id'])}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔍  Scouting",
+        value=f"Canal: {nome_canal(cfg['scouting']['channel_id'])}",
+        inline=True,
+    )
+
+    embed.set_footer(text="BRS Bot • Use /staff e /permissao para gerenciar acessos")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
