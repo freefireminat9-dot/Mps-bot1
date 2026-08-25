@@ -1,16 +1,16 @@
 """
 Bot Discord completo — BRS (Brazilian Roblox Soccer)
-Prefixos: ,  e  /
+Prefixo: ,
 Slash: /
 
 Recursos:
   - Tickets
-  - Drop estilo PAFO (select menu + cargos temporários 5 dias)
+  - Drop estilo PAFO (select menu + cargos 5 dias)
   - Meta de membros → Wave Drop
   - Free Agent / Scouting
-  - /role (sem ID no código)
-  - /say e /say_embed (foto do bot automática)
-  - Permissões e config organizada
+  - /role
+  - /say e /say_embed
+  - Permissões e config
 """
 
 import os
@@ -38,11 +38,11 @@ GUILD = discord.Object(id=GUILD_ID)
 EMBED_COLOR = 0x2B2D31
 DATA_PATH = os.path.join(os.path.dirname(__file__), "data.json")
 
-# Cargos de recompensa do Drop (os que você passou)
+# Cargos de recompensa do Drop
 DROP_REWARD_ROLES = {
-    1541835699873914900: {"nome": "Olheiro (5 Dias)", "emoji": "🔍"},
-    1541832115052871830: {"nome": "Scrim Hoster (5 Dias)", "emoji": "⚔️"},
-    1541836120382382100: {"nome": "Pic Perm (5 Dias)", "emoji": "💥"},
+    1541835699873914900: {"nome": "Olheiro (5 Dias)", "emoji": "🔍", "desc": "Cargo de Olheiro por 5 dias"},
+    1541832115052871830: {"nome": "Scrim Hoster (5 Dias)", "emoji": "⚔️", "desc": "Pode hostear scrims por 5 dias"},
+    1541836120382382100: {"nome": "Pic Perm (5 Dias)", "emoji": "💥", "desc": "Permissão de foto por 5 dias"},
 }
 # ============================================================
 
@@ -57,7 +57,7 @@ ACTIVE_DROP: Optional[dict] = None
 WAVE_RUNNING = False
 
 # ============================================================
-#  BANCO DE PERGUNTAS (diverso)
+#  BANCO DE PERGUNTAS
 # ============================================================
 DROP_QUESTIONS = [
     {"q": "Qual time brasileiro é conhecido como 'O Mais Querido'?", "a": "flamengo"},
@@ -190,7 +190,7 @@ async def checar_permissao(interaction: discord.Interaction, comando: str) -> bo
 class BRSBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix=commands.when_mentioned_or(",", "/"),
+            command_prefix=commands.when_mentioned_or(","),  # só vírgula (não repete mais)
             intents=intents,
             help_command=None,
         )
@@ -224,7 +224,7 @@ async def on_message(message: discord.Message):
         return
 
     # === DROP ===
-    if ACTIVE_DROP and not ACTIVE_DROP["finalizado"] and message.channel.id == ACTIVE_DROP["canal_id"]:
+    if ACTIVE_DROP and not ACTIVE_DROP.get("finalizado") and message.channel.id == ACTIVE_DROP["canal_id"]:
         if normalizar(message.content) == ACTIVE_DROP["resposta_normalizada"]:
             ACTIVE_DROP["finalizado"] = True
             vencedor = message.author
@@ -237,26 +237,35 @@ async def on_message(message: discord.Message):
                 )
             )
 
-            role_ids = DADOS["config"]["drop"].get("reward_role_ids", list(DROP_REWARD_ROLES.keys()))
-            roles = [r for rid in role_ids if (r := message.guild.get_role(rid))]
+            role_ids = DADOS["config"]["drop"].get("reward_role_ids") or list(DROP_REWARD_ROLES.keys())
+            roles = []
+            for rid in role_ids:
+                role = message.guild.get_role(rid)
+                if role:
+                    roles.append(role)
 
             try:
                 if roles:
                     dm_embed = discord.Embed(
                         title="🎁 Você Venceu o Drop!",
                         description=(
-                            "Você respondeu corretamente no chat e garantiu seu prêmio.\n"
-                            "Escolha abaixo qual cargo você deseja receber no servidor:"
+                            "Você respondeu corretamente e garantiu seu prêmio!\n\n"
+                            "Escolha abaixo qual cargo VIP você deseja receber:"
                         ),
-                        color=discord.Color.gold(),
+                        color=discord.Color.gold()
                     )
-                    dm_embed.set_footer(text="BRS — Drops System")
+                    dm_embed.set_footer(text="BRS — Drops System • Válido por 5 dias")
                     await vencedor.send(embed=dm_embed, view=DropRewardView(vencedor.id, roles))
                 else:
-                    await vencedor.send("🏆 Você venceu o Drop, mas nenhum cargo de recompensa está configurado.")
+                    await vencedor.send(
+                        "🏆 Você venceu o Drop!\n\n"
+                        "Porém nenhum cargo de recompensa está disponível no momento.\n"
+                        "Avise a staff para configurar os cargos corretamente."
+                    )
             except discord.Forbidden:
                 await message.channel.send(
-                    f"⚠️ {vencedor.mention}, não consegui te enviar DM. Habilite mensagens diretas do servidor!"
+                    f"⚠️ {vencedor.mention}, não consegui te enviar DM.\n"
+                    "Habilite **Mensagens Diretas** nas configurações de privacidade do servidor!"
                 )
 
             ACTIVE_DROP = None
@@ -465,22 +474,28 @@ async def ticket_remove(interaction: discord.Interaction, alvo: Union[discord.Me
 
 
 # ============================================================
-#  DROP — estilo PAFO
+#  DROP
 # ============================================================
 class DropRewardSelect(discord.ui.Select):
     def __init__(self, user_id: int, roles: list[discord.Role]):
         options = []
-        for role in roles[:3]:
-            info = DROP_REWARD_ROLES.get(role.id, {"nome": f"{role.name} (5 Dias)", "emoji": "🏅"})
+        for role in roles:
+            info = DROP_REWARD_ROLES.get(role.id, {
+                "nome": f"{role.name} (5 Dias)",
+                "emoji": "🏅",
+                "desc": "Recompensa do Drop"
+            })
             options.append(discord.SelectOption(
                 label=info["nome"][:100],
                 value=str(role.id),
                 emoji=info["emoji"],
-                description="Válido por 5 dias"
+                description=info.get("desc", "Válido por 5 dias")[:100]
             ))
         super().__init__(
-            placeholder="Escolha seu cargo VIP (Válido por 5 dias)",
-            min_values=1, max_values=1, options=options
+            placeholder="🎁 Escolha seu cargo VIP (válido por 5 dias)",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
         )
         self.user_id = user_id
 
@@ -491,14 +506,30 @@ class DropRewardSelect(discord.ui.Select):
 
         role_id = int(self.values[0])
         guild = bot.get_guild(GUILD_ID)
-        member = guild.get_member(self.user_id) if guild else None
-        role = guild.get_role(role_id) if guild else None
-
-        if not (guild and member and role):
-            await interaction.response.send_message("❌ Não consegui aplicar o cargo. Fale com a staff.", ephemeral=True)
+        if not guild:
+            await interaction.response.send_message("❌ Erro interno. Fale com a staff.", ephemeral=True)
             return
 
-        await member.add_roles(role, reason="Recompensa do Drop BRS (5 dias)")
+        member = guild.get_member(self.user_id)
+        role = guild.get_role(role_id)
+
+        if not member or not role:
+            await interaction.response.send_message(
+                "❌ Não consegui encontrar o cargo ou o membro.\n"
+                "Provavelmente o cargo foi deletado ou o bot perdeu permissão.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await member.add_roles(role, reason="Recompensa do Drop BRS (5 dias)")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Não tenho permissão para dar esse cargo.\n"
+                "Peça para a staff colocar o cargo do bot **acima** dos cargos de prêmio.",
+                ephemeral=True
+            )
+            return
 
         expiracao = (datetime.datetime.utcnow() + datetime.timedelta(days=5)).isoformat()
         DADOS.setdefault("drop_expiracoes", {})[str(member.id)] = {
@@ -509,7 +540,7 @@ class DropRewardSelect(discord.ui.Select):
 
         embed = discord.Embed(
             title="✅ Drop Resgatado com Sucesso!",
-            description=f"Você recebeu o cargo {role.mention}.",
+            description=f"Você recebeu o cargo **{role.mention}**\n\nVálido por **5 dias**.",
             color=discord.Color.from_rgb(46, 204, 113)
         )
         embed.set_footer(text="BRS — Drops System")
@@ -519,7 +550,8 @@ class DropRewardSelect(discord.ui.Select):
 class DropRewardView(discord.ui.View):
     def __init__(self, user_id: int, roles: list[discord.Role]):
         super().__init__(timeout=600)
-        self.add_item(DropRewardSelect(user_id, roles))
+        if roles:
+            self.add_item(DropRewardSelect(user_id, roles))
 
 
 drop_group = app_commands.Group(name="drop", description="Sistema de Drops da BRS")
@@ -541,7 +573,7 @@ async def drop_iniciar(
         return
 
     global ACTIVE_DROP
-    if ACTIVE_DROP and not ACTIVE_DROP["finalizado"]:
+    if ACTIVE_DROP and not ACTIVE_DROP.get("finalizado"):
         await interaction.response.send_message("❌ Já existe um Drop em andamento. Use `/drop cancelar`.", ephemeral=True)
         return
 
@@ -592,7 +624,7 @@ async def drop_cancelar(interaction: discord.Interaction):
     if not await checar_permissao(interaction, "drop"):
         return
     global ACTIVE_DROP
-    if not ACTIVE_DROP or ACTIVE_DROP["finalizado"]:
+    if not ACTIVE_DROP or ACTIVE_DROP.get("finalizado"):
         await interaction.response.send_message("ℹ️ Não há Drop em andamento.", ephemeral=True)
         return
     canal = interaction.guild.get_channel(ACTIVE_DROP["canal_id"])
@@ -719,7 +751,6 @@ async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] 
         )
         await canal_destino.send(embed=embed)
 
-        # espera até alguém acertar ou \~3 minutos
         for _ in range(36):
             await asyncio.sleep(5)
             if ACTIVE_DROP is None or ACTIVE_DROP.get("finalizado"):
@@ -734,7 +765,6 @@ async def drop_wave(interaction: discord.Interaction, quantidade: Optional[int] 
     )
 
 
-# Atualiza meta quando membro entra/sai
 @bot.event
 async def on_member_join(member: discord.Member):
     await atualizar_meta(member.guild)
