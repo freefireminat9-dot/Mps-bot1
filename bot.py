@@ -509,7 +509,10 @@ class TicketControlView(discord.ui.View):
         )
     ]
 )
-async def ticket_cmd(interaction, acao):
+async def ticket_cmd(
+    interaction: discord.Interaction,
+    acao: app_commands.Choice[str]
+):
 
     if acao.value == "painel":
 
