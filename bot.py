@@ -380,6 +380,15 @@ TODAS_PERGUNTAS = gerar_banco_perguntas()
 # ============================================================
 #  PERSISTÊNCIA
 # ============================================================
+# Cargos que aparecem na DM quando alguém vence um Drop.
+# A lista fica configurável depois pelos comandos de prêmio, mas estes três
+# são os cargos iniciais definidos para a BRS.
+DEFAULT_DROP_REWARD_ROLE_IDS = [
+    1541600905298714664,
+    1541600835472072724,
+    1541065148590989332,
+]
+
 DEFAULT_CONFIG = {
     "staff_role_ids": [],
     "command_permissions": {
@@ -394,7 +403,8 @@ DEFAULT_CONFIG = {
         "log_channel_id": None,
     },
     "drop": {
-        "reward_role_ids": [],
+        "reward_role_ids": list(DEFAULT_DROP_REWARD_ROLE_IDS),
+        "reward_roles_version": 2,
         "default_channel_id": None,
         "quantidade_drops": 7,
         "intervalo_drops_segundos": 8,
@@ -418,8 +428,13 @@ def carregar_dados() -> dict:
     for chave, valor in DEFAULT_CONFIG.items():
         dados["config"].setdefault(chave, copy.deepcopy(valor))
     dados["config"].setdefault("command_permissions", {})
-    dados["config"]["drop"].setdefault("reward_role_ids", [])
-    dados["config"]["drop"].setdefault("quantidade_drops", 7)
+    drop_cfg = dados["config"]["drop"]
+    # Migra configurações antigas uma única vez para os três cargos corretos.
+    if drop_cfg.get("reward_roles_version") != 2:
+        drop_cfg["reward_role_ids"] = list(DEFAULT_DROP_REWARD_ROLE_IDS)
+        drop_cfg["reward_roles_version"] = 2
+    drop_cfg.setdefault("reward_role_ids", list(DEFAULT_DROP_REWARD_ROLE_IDS))
+    drop_cfg.setdefault("quantidade_drops", 7)
     dados["config"]["drop"].setdefault("intervalo_drops_segundos", 8)
     dados["config"]["drop"].setdefault("tempo_resposta_segundos", 180)
     for cmd in DEFAULT_CONFIG["command_permissions"]:
