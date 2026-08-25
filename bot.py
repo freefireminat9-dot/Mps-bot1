@@ -1,39 +1,3 @@
-"""
-Bot Discord para liga de MPS (Modified Professional Soccer / Ro-Soccer)
-
-Comandos:
-  /say            - envia uma mensagem de texto pelo bot
-  /say_embed      - envia uma mensagem em embed pelo bot
-  /freeagent      - anuncia um jogador como free agent
-  /scouting       - anuncia que um time está procurando jogadores
-  /contract       - anuncia a assinatura de contrato de um jogador
-  /release        - anuncia a liberação/dispensa de um jogador
-  /elenco         - mostra o elenco de um time (baseado em cargo)
-  /friendly       - anuncia/agenda um amistoso entre dois times
-  /setup          - cria o painel de abertura de tickets
-  /add            - adiciona membro/cargo a um ticket
-  /remove         - remove membro/cargo de um ticket
-
-Todas as respostas de interação são ephemeral (visíveis apenas para quem usou o
-comando). Comandos de anúncio (freeagent, scouting, contract, release, friendly,
-say, say_embed) publicam o conteúdo no canal normalmente (para a liga ver), mas
-a confirmação do comando em si só aparece para quem executou.
-"""
-
-import os
-import datetime
-import logging
-from typing import Optional, Union
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# ============================================================
-#  CONFIGURAÇÕES — edite conforme a sua liga
 # ============================================================
 GUILD_ID = 1540722239027023882
 GUILD = discord.Object(id=GUILD_ID)
