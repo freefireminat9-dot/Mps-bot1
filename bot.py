@@ -1,3 +1,39 @@
+"""
+Bot Discord para liga de MPS (Modified Professional Soccer / Ro-Soccer)
+
+Comandos:
+  /say            - envia uma mensagem de texto pelo bot
+  /say_embed      - envia uma mensagem em embed pelo bot
+  /freeagent      - anuncia um jogador como free agent
+  /scouting       - anuncia que um time está procurando jogadores
+  /contract       - anuncia a assinatura de contrato de um jogador
+  /release        - anuncia a liberação/dispensa de um jogador
+  /elenco         - mostra o elenco de um time (baseado em cargo)
+  /friendly       - anuncia/agenda um amistoso entre dois times
+  /setup          - cria o painel de abertura de tickets
+  /add            - adiciona membro/cargo a um ticket
+  /remove         - remove membro/cargo de um ticket
+
+Todas as respostas de interação são ephemeral (visíveis apenas para quem usou o
+comando). Comandos de anúncio (freeagent, scouting, contract, release, friendly,
+say, say_embed) publicam o conteúdo no canal normalmente (para a liga ver), mas
+a confirmação do comando em si só aparece para quem executou.
+"""
+
+import os
+import datetime
+import logging
+from typing import Optional, Union
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ============================================================
+#  CONFIGURAÇÕES — edite conforme a sua liga
 # ============================================================
 GUILD_ID = 1540722239027023882
 GUILD = discord.Object(id=GUILD_ID)
@@ -9,6 +45,10 @@ TICKET_CATEGORY_ID: Optional[int] = None
 # ID do cargo de staff que deve enxergar TODOS os tickets automaticamente
 # (opcional). Deixe None se não quiser isso.
 TICKET_STAFF_ROLE_ID: Optional[int] = None
+
+SCRIM_HOSTER_ROLE_ID: Optional[int] = 1541065148590989332
+PIC_PERM_ROLE_ID: Optional[int] = 1541600905298714664
+SCOUTING_ROLE_ID: Optional[int] = 1541600835472072724
 
 # Cor padrão usada nos embeds quando nenhuma cor é especificada.
 EMBED_COLOR = 0x2B2D31
@@ -44,6 +84,21 @@ bot = MPSBot()
 @bot.event
 async def on_ready():
     log.info("Bot conectado como %s (ID: %s)", bot.user, bot.user.id)
+
+
+# ============================================================
+#  FUNÇÃO AUXILIAR DE PERMISSÃO POR CARGO
+# ============================================================
+def tem_cargo(*role_ids: Optional[int]):
+    """Verifica se o usuário possui pelo menos um dos cargos especificados ou é Administrador."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
+        user_roles = [role.id for role in interaction.user.roles]
+        if any(rid in user_roles for rid in role_ids if rid is not None):
+            return True
+        raise app_commands.MissingPermissions([])
+    return app_commands.check(predicate)
 
 
 # ============================================================
@@ -291,6 +346,7 @@ async def freeagent_cmd(
 
 
 @bot.tree.command(name="scouting", description="Anuncia que um time está procurando jogadores.", guild=GUILD)
+@tem_cargo(SCOUTING_ROLE_ID)
 @app_commands.describe(
     time="Nome do time que está scoutando",
     posicao="Posição desejada",
@@ -322,13 +378,6 @@ async def scouting_cmd(
 
 
 @bot.tree.command(name="contract", description="Anuncia a assinatura de contrato de um jogador com um time.", guild=GUILD)
-@app_commands.describe(
-    jogador="Jogador que assinou",
-    time="Nome do time",
-    posicao="Posição do jogador (opcional)",
-    valor="Valor do contrato (opcional)",
-    temporadas="Duração do contrato (opcional)",
-)
 async def contract_cmd(
     interaction: discord.Interaction,
     jogador: discord.Member,
@@ -357,11 +406,6 @@ async def contract_cmd(
 
 
 @bot.tree.command(name="release", description="Anuncia a liberação/dispensa de um jogador de um time.", guild=GUILD)
-@app_commands.describe(
-    jogador="Jogador que foi liberado",
-    time="Nome do time",
-    motivo="Motivo da liberação (opcional)",
-)
 async def release_cmd(
     interaction: discord.Interaction,
     jogador: discord.Member,
@@ -384,7 +428,6 @@ async def release_cmd(
 
 
 @bot.tree.command(name="elenco", description="Mostra o elenco de um time com base em um cargo.", guild=GUILD)
-@app_commands.describe(cargo="Cargo que representa o time")
 async def elenco_cmd(interaction: discord.Interaction, cargo: discord.Role):
     membros = [m for m in cargo.members if not m.bot]
 
@@ -400,6 +443,7 @@ async def elenco_cmd(interaction: discord.Interaction, cargo: discord.Role):
 
 
 @bot.tree.command(name="friendly", description="Anuncia/agenda um amistoso entre dois times.", guild=GUILD)
+@tem_cargo(SCRIM_HOSTER_ROLE_ID, PIC_PERM_ROLE_ID)
 @app_commands.describe(
     time1="Primeiro time",
     time2="Segundo time",
