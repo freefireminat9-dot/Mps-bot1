@@ -1,826 +1,1012 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
+"""
+Bot Discord completo para a BRS (Brazilian Roblox Soccer)
+
+Comandos (todos slash /):
+  /ticket configurar        - configura categoria, cargos de staff, nome do
+                               canal, mensagem inicial e canal de logs
+  /ticket painel             - envia o painel de abertura de tickets
+  /ticket add / remove       - adiciona/remove membro ou cargo do ticket atual
+
+  /drop iniciar               - staff configura pergunta + resposta e lança o Drop
+  /drop cancelar               - cancela o Drop em andamento
+  /drop premio_adicionar       - adiciona um cargo como prêmio do Drop
+  /drop premio_remover         - remove um cargo dos prêmios do Drop
+  /drop canal_padrao           - define o canal padrão dos Drops
+
+  /freeagent add / remover / editar / buscar / lista / canal
+  /scouting add / remover / editar / status / buscar / lista / canal
+
+  /say                        - envia uma mensagem de texto pelo bot
+  /say_embed                  - envia uma mensagem em embed pelo bot
+
+  /staff                      - define cargo(s) de Staff geral (acesso total)
+  /permissao                  - libera/revoga um cargo para um comando específico
+  /config_ver                 - mostra as configurações atuais (admin)
+
+Todas as configurações ficam salvas em data.json e sobrevivem a reinícios do
+bot (mas não a um redeploy que apague o disco — ver README).
+
+Comandos de configuração/gerenciamento respondem sempre de forma ephemeral
+(visível só para quem usou).
+"""
+
 import os
 import json
-import asyncio
-import random
+import copy
 import datetime
+import logging
 import unicodedata
-from typing import Optional
+from typing import Optional, Union
 
-# =========================================================
-# CONFIG
-# =========================================================
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+load_dotenv()
+
+# ============================================================
+#  CONFIGURAÇÕES FIXAS — edite conforme a sua liga
+# ============================================================
 GUILD_ID = 1540722239027023882
-PREFIX = "?"
-
 GUILD = discord.Object(id=GUILD_ID)
-CONFIG_FILE = "config.json"
+EMBED_COLOR = 0x2B2D31
+DATA_PATH = os.path.join(os.path.dirname(__file__), "data.json")
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("brs-bot")
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 
-# =========================================================
-# CONFIG JSON
-# =========================================================
+# Estado transiente do Drop atual (não é salvo em disco — some se o bot reiniciar)
+ACTIVE_DROP: Optional[dict] = None
+
+# ============================================================
+#  PERSISTÊNCIA (data.json)
+# ============================================================
 
 DEFAULT_CONFIG = {
-    "staff_roles": [],
-    "role_ids": [],
-    "command_roles": {
-        "ticket": [],
-        "drop": [],
-        "freeagent": [],
-        "scouting": [],
-        "say": [],
-        "say_embed": []
+    "staff_role_ids": [],
+    "command_permissions": {
+        "ticket": [], "drop": [], "freeagent": [], "scouting": [], "say": [], "say_embed": [],
     },
     "ticket": {
         "category_id": None,
-        "staff_roles": [],
-        "log_channel_id": None
+        "staff_role_ids": [],
+        "channel_name_template": "ticket-{user}",
+        "welcome_message": "Olá {mention}, seja bem-vindo(a) à BRS! Descreva sua solicitação e aguarde o atendimento da staff.",
+        "log_channel_id": None,
     },
     "drop": {
-        "channel_id": None,
-        "time": 60,
-        "reward_roles": []
+        "reward_role_ids": [],
+        "default_channel_id": None,
     },
-    "freeagent": {},
-    "scouting": {}
+    "freeagent": {"channel_id": None},
+    "scouting": {"channel_id": None},
 }
 
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        config = json.loads(json.dumps(DEFAULT_CONFIG))
-
-        def merge(a, b):
-            for key, value in b.items():
-                if isinstance(value, dict) and isinstance(a.get(key), dict):
-                    merge(a[key], value)
-                else:
-                    a[key] = value
-
-        merge(config, data)
-        return config
-
-    except Exception:
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+def carregar_dados() -> dict:
+    if not os.path.exists(DATA_PATH):
+        return {"config": copy.deepcopy(DEFAULT_CONFIG), "freeagents": {}, "scoutings": {}}
+    with open(DATA_PATH, "r", encoding="utf-8") as f:
+        dados = json.load(f)
+    dados.setdefault("config", copy.deepcopy(DEFAULT_CONFIG))
+    for chave, valor in DEFAULT_CONFIG.items():
+        dados["config"].setdefault(chave, copy.deepcopy(valor))
+    dados["config"].setdefault("command_permissions", {})
+    for cmd in DEFAULT_CONFIG["command_permissions"]:
+        dados["config"]["command_permissions"].setdefault(cmd, [])
+    dados.setdefault("freeagents", {})
+    dados.setdefault("scoutings", {})
+    return dados
 
 
-def save_config():
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+def salvar_dados(dados: dict):
+    with open(DATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
 
 
-CONFIG = load_config()
+DADOS = carregar_dados()
 
-# =========================================================
-# BOT
-# =========================================================
+
+def normalizar(texto: str) -> str:
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return texto.strip().lower()
+
+
+def tem_permissao(member: discord.Member, comando: str) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    cfg = DADOS["config"]
+    ids_permitidos = set(cfg["staff_role_ids"]) | set(cfg["command_permissions"].get(comando, []))
+    if not ids_permitidos:
+        return False
+    ids_membro = {r.id for r in member.roles}
+    return bool(ids_permitidos & ids_membro)
+
+
+async def checar_permissao(interaction: discord.Interaction, comando: str) -> bool:
+    if not tem_permissao(interaction.user, comando):
+        await interaction.response.send_message(
+            "❌ Você não tem permissão para usar este comando.\n"
+            "Peça para um administrador liberar com `/permissao` ou `/staff`.",
+            ephemeral=True,
+        )
+        return False
+    return True
+
+
+# ============================================================
+#  BOT
+# ============================================================
 
 class BRSBot(commands.Bot):
-
     def __init__(self):
-        super().__init__(
-            command_prefix=PREFIX,
-            intents=intents
-        )
-
-        self.active_drops = {}
+        super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        self.add_view(TicketPanel())
-        self.add_view(TicketControl())
+        self.add_view(TicketPanelView())
+        self.add_view(TicketControlView())
+
+        self.tree.add_command(ticket_group, guild=GUILD)
+        self.tree.add_command(drop_group, guild=GUILD)
+        self.tree.add_command(freeagent_group, guild=GUILD)
+        self.tree.add_command(scouting_group, guild=GUILD)
 
         synced = await self.tree.sync(guild=GUILD)
-        print(f"✅ {len(synced)} slash commands sincronizados.")
+        log.info("Sincronizados %s comandos na guild %s", len(synced), GUILD_ID)
 
 
 bot = BRSBot()
 
-# =========================================================
-# UTILIDADES
-# =========================================================
-
-def normalize(text):
-    return unicodedata.normalize(
-        "NFKD",
-        text
-    ).encode(
-        "ascii",
-        "ignore"
-    ).decode().lower().strip()
-
-
-def is_admin(member):
-    return member.guild_permissions.administrator
-
-
-def has_permission(member, command):
-    if is_admin(member):
-        return True
-
-    ids = CONFIG["command_roles"].get(command, [])
-
-    return any(role.id in ids for role in member.roles)
-
-
-async def permission(interaction, command):
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "❌ Use este comando dentro do servidor.",
-            ephemeral=True
-        )
-        return False
-
-    if has_permission(interaction.user, command):
-        return True
-
-    await interaction.response.send_message(
-        "🚫 Você não tem permissão para usar esse comando.",
-        ephemeral=True
-    )
-    return False
-
-
-def get_channel(channel_id):
-    if not channel_id:
-        return None
-
-    return bot.get_channel(channel_id)
-
-
-# =========================================================
-# TICKET
-# =========================================================
-
-class TicketPanel(discord.ui.View):
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Abrir Ticket",
-        emoji="🎫",
-        style=discord.ButtonStyle.green,
-        custom_id="brs_open_ticket"
-    )
-    async def open_ticket(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = interaction.guild
-
-        if guild is None:
-            return
-
-        for channel in guild.text_channels:
-            if channel.topic == f"ticket:{interaction.user.id}":
-                await interaction.response.send_message(
-                    f"❌ Você já possui um ticket: {channel.mention}",
-                    ephemeral=True
-                )
-                return
-
-        category = None
-        category_id = CONFIG["ticket"].get("category_id")
-
-        if category_id:
-            category = guild.get_channel(category_id)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=False
-            ),
-
-            interaction.user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
-        }
-
-        if guild.me:
-            overwrites[guild.me] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True
-            )
-
-        for role_id in CONFIG["ticket"].get("staff_roles", []):
-            role = guild.get_role(role_id)
-
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True
-                )
-
-        channel = await guild.create_text_channel(
-            name=f"ticket-{interaction.user.name}".lower()[:90],
-            category=category,
-            overwrites=overwrites,
-            topic=f"ticket:{interaction.user.id}"
-        )
-
-        embed = discord.Embed(
-            title="🎫 Atendimento",
-            description=(
-                f"Olá {interaction.user.mention}!\n\n"
-                "Explique seu problema e aguarde a Staff."
-            ),
-            color=0x2B2D31
-        )
-
-        await channel.send(
-            content=interaction.user.mention,
-            embed=embed,
-            view=TicketControl()
-        )
-
-        await interaction.response.send_message(
-            f"✅ Ticket criado: {channel.mention}",
-            ephemeral=True
-        )
-
-
-class TicketControl(discord.ui.View):
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Fechar Ticket",
-        emoji="🔒",
-        style=discord.ButtonStyle.red,
-        custom_id="brs_close_ticket"
-    )
-    async def close_ticket(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        channel = interaction.channel
-
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "❌ Canal inválido.",
-                ephemeral=True
-            )
-            return
-
-        if not channel.name.startswith("ticket-"):
-            await interaction.response.send_message(
-                "❌ Este canal não é um ticket.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            "🔒 Ticket fechado. Apagando em 5 segundos."
-        )
-
-        await asyncio.sleep(5)
-
-        try:
-            await channel.delete(reason="Ticket fechado")
-        except discord.Forbidden:
-            pass
-
-
-@bot.tree.command(
-    name="ticket",
-    description="Sistema de tickets",
-    guild=GUILD
-)
-@app_commands.describe(
-    acao="Ação do sistema"
-)
-@app_commands.choices(
-    acao=[
-        app_commands.Choice(
-            name="Enviar painel",
-            value="painel"
-        ),
-        app_commands.Choice(
-            name="Configurar",
-            value="config"
-        )
-    ]
-)
-async def ticket_cmd(
-    interaction: discord.Interaction,
-    acao: app_commands.Choice[str]
-):
-
-    if acao.value == "painel":
-
-        if not await permission(interaction, "ticket"):
-            return
-
-        embed = discord.Embed(
-            title="🎫 CENTRAL DE ATENDIMENTO",
-            description=(
-                "Clique no botão abaixo para abrir "
-                "um ticket privado."
-            ),
-            color=0x2B2D31
-        )
-
-        await interaction.channel.send(
-            embed=embed,
-            view=TicketPanel()
-        )
-
-        await interaction.response.send_message(
-            "✅ Painel enviado.",
-            ephemeral=True
-        )
-
-    elif acao.value == "config":
-
-        if not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "🚫 Apenas administradores.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            "Use `/config` para configurar.",
-            ephemeral=True
-        )
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-@bot.tree.command(
-    name="config",
-    description="Configura o bot",
-    guild=GUILD
-)
-@app_commands.describe(
-    tipo="O que deseja configurar",
-    valor="ID"
-)
-@app_commands.choices(
-    tipo=[
-        app_commands.Choice(name="Staff", value="staff"),
-        app_commands.Choice(
-            name="Categoria Ticket",
-            value="ticket_category"
-        ),
-        app_commands.Choice(
-            name="Logs Ticket",
-            value="ticket_logs"
-        ),
-        app_commands.Choice(
-            name="Canal Drop",
-            value="drop_channel"
-        ),
-        app_commands.Choice(
-            name="Canal Free Agent",
-            value="freeagent_channel"
-        ),
-        app_commands.Choice(
-            name="Canal Scouting",
-            value="scouting_channel"
-        )
-    ]
-)
-async def config_cmd(
-    interaction: discord.Interaction,
-    tipo: app_commands.Choice[str],
-    valor: str
-):
-
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "🚫 Apenas administradores.",
-            ephemeral=True
-        )
-        return
-
-    try:
-        value = int(valor)
-    except ValueError:
-        await interaction.response.send_message(
-            "❌ ID inválido.",
-            ephemeral=True
-        )
-        return
-
-    if tipo.value == "staff":
-
-        if value not in CONFIG["staff_roles"]:
-            CONFIG["staff_roles"].append(value)
-
-        if value not in CONFIG["ticket"]["staff_roles"]:
-            CONFIG["ticket"]["staff_roles"].append(value)
-
-        msg = "Staff"
-
-    elif tipo.value == "ticket_category":
-        CONFIG["ticket"]["category_id"] = value
-        msg = "categoria de tickets"
-
-    elif tipo.value == "ticket_logs":
-        CONFIG["ticket"]["log_channel_id"] = value
-        msg = "logs"
-
-    elif tipo.value == "drop_channel":
-        CONFIG["drop"]["channel_id"] = value
-        msg = "canal de Drop"
-
-    elif tipo.value == "freeagent_channel":
-        CONFIG["freeagent"]["channel_id"] = value
-        msg = "canal de Free Agent"
-
-    elif tipo.value == "scouting_channel":
-        CONFIG["scouting"]["channel_id"] = value
-        msg = "canal de Scouting"
-
-    else:
-        return
-
-    save_config()
-
-    await interaction.response.send_message(
-        f"✅ {msg} configurado.",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(
-    name="config_role",
-    description="Libera um cargo para usar um comando",
-    guild=GUILD
-)
-@app_commands.describe(
-    comando="Comando",
-    cargo="Cargo"
-)
-async def config_role_cmd(
-    interaction: discord.Interaction,
-    comando: str,
-    cargo: discord.Role
-):
-
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "🚫 Apenas administradores.",
-            ephemeral=True
-        )
-        return
-
-    comando = comando.lower()
-
-    if comando not in CONFIG["command_roles"]:
-        await interaction.response.send_message(
-            "❌ Comando inválido.",
-            ephemeral=True
-        )
-        return
-
-    if cargo.id not in CONFIG["command_roles"][comando]:
-        CONFIG["command_roles"][comando].append(cargo.id)
-
-    save_config()
-
-    await interaction.response.send_message(
-        f"✅ {cargo.mention} autorizado para `/{comando}`.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# CARGO ID
-# =========================================================
-
-@bot.command(name="cargoid")
-async def cargoid(ctx, *, nome=None):
-
-    if not ctx.guild:
-        return
-
-    if not nome:
-        await ctx.send("❌ Use `?cargoid Nome do Cargo`")
-        return
-
-    role = discord.utils.find(
-        lambda r: r.name.lower() == nome.lower(),
-        ctx.guild.roles
-    )
-
-    if not role:
-        await ctx.send("❌ Cargo não encontrado.")
-        return
-
-    await ctx.send(
-        f"🆔 ID de **{role.name}**: `{role.id}`"
-    )
-
-
-# =========================================================
-# ROLE
-# =========================================================
-
-# COLOQUE AQUI OS IDs DOS CARGOS PERMITIDOS
-SELF_ASSIGNABLE_ROLE_IDS = [
-    # 123456789012345678,
-]
-
-
-@bot.command(name="role")
-async def role_cmd(ctx, *, nome=None):
-
-    if not ctx.guild:
-        return
-
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send(
-            "🚫 Apenas administradores podem usar `?role`."
-        )
-        return
-
-    if not nome:
-        await ctx.send(
-            "❌ Use `?role Nome do Cargo`."
-        )
-        return
-
-    role = discord.utils.find(
-        lambda r: r.name.lower() == nome.lower(),
-        ctx.guild.roles
-    )
-
-    if not role:
-        await ctx.send(
-            f"❌ Cargo **{nome}** não encontrado."
-        )
-        return
-
-    if role.is_default():
-        await ctx.send("❌ Não pode usar @everyone.")
-        return
-
-    if role.id not in SELF_ASSIGNABLE_ROLE_IDS:
-        await ctx.send(
-            "🚫 Esse cargo não está liberado no sistema."
-        )
-        return
-
-    if role.permissions.administrator:
-        await ctx.send(
-            "🚫 Cargo com Administrador não pode ser usado."
-        )
-        return
-
-    if ctx.guild.me and role >= ctx.guild.me.top_role:
-        await ctx.send(
-            "❌ Meu cargo precisa estar acima desse cargo."
-        )
-        return
-
-    try:
-
-        if role in ctx.author.roles:
-            await ctx.author.remove_roles(role)
-            await ctx.send(
-                f"➖ **{role.name}** removido."
-            )
-        else:
-            await ctx.author.add_roles(role)
-            await ctx.send(
-                f"➕ **{role.name}** adicionado."
-            )
-
-    except discord.Forbidden:
-        await ctx.send(
-            "❌ Não tenho permissão para mexer nesse cargo."
-        )
-
-
-# =========================================================
-# STATUS
-# =========================================================
-
-@bot.tree.command(
-    name="status",
-    description="Mostra o status do bot",
-    guild=GUILD
-)
-async def status_cmd(interaction):
-
-    embed = discord.Embed(
-        title="🤖 BRS SYSTEM",
-        color=discord.Color.green()
-    )
-
-    embed.add_field(
-        name="Status",
-        value="🟢 Online"
-    )
-
-    embed.add_field(
-        name="Ping",
-        value=f"{round(bot.latency * 1000)}ms"
-    )
-
-    embed.add_field(
-        name="Drops",
-        value=str(len(bot.active_drops))
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
-
-
-# =========================================================
-# SAY
-# =========================================================
-
-@bot.tree.command(
-    name="say",
-    description="Faz o bot enviar uma mensagem",
-    guild=GUILD
-)
-@app_commands.describe(
-    mensagem="Mensagem",
-    canal="Canal"
-)
-async def say_cmd(
-    interaction,
-    mensagem: str,
-    canal: Optional[discord.TextChannel] = None
-):
-
-    if not await permission(interaction, "say"):
-        return
-
-    canal = canal or interaction.channel
-
-    await canal.send(
-        mensagem.replace("\\n", "\n")
-    )
-
-    await interaction.response.send_message(
-        "✅ Mensagem enviada.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# SAY EMBED
-# =========================================================
-
-@bot.tree.command(
-    name="say_embed",
-    description="Envia uma Embed",
-    guild=GUILD
-)
-@app_commands.describe(
-    titulo="Título",
-    descricao="Descrição",
-    canal="Canal",
-    footer="Rodapé"
-)
-async def say_embed_cmd(
-    interaction,
-    titulo: str,
-    descricao: str,
-    canal: Optional[discord.TextChannel] = None,
-    footer: Optional[str] = None
-):
-
-    if not await permission(interaction, "say_embed"):
-        return
-
-    canal = canal or interaction.channel
-
-    embed = discord.Embed(
-        title=titulo,
-        description=descricao.replace("\\n", "\n"),
-        color=0x2B2D31
-    )
-
-    if footer:
-        embed.set_footer(text=footer)
-
-    await canal.send(embed=embed)
-
-    await interaction.response.send_message(
-        "✅ Embed enviada.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# CLEAR
-# =========================================================
-
-@bot.tree.command(
-    name="clear",
-    description="Apaga mensagens",
-    guild=GUILD
-)
-@app_commands.describe(
-    quantidade="Quantidade de mensagens"
-)
-async def clear_cmd(
-    interaction,
-    quantidade: int
-):
-
-    if not await permission(interaction, "say"):
-        return
-
-    if quantidade < 1 or quantidade > 100:
-        await interaction.response.send_message(
-            "❌ Use entre 1 e 100.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-    mensagens = await interaction.channel.purge(
-        limit=quantidade
-    )
-
-    await interaction.followup.send(
-        f"🧹 {len(mensagens)} mensagens apagadas.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# ERROS
-# =========================================================
-
-@bot.tree.error
-async def tree_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError
-):
-
-    print("ERRO:", repr(error))
-
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                "❌ Deu erro ao executar o comando.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ Deu erro ao executar o comando.",
-                ephemeral=True
-            )
-    except:
-        pass
-
-
-# =========================================================
-# READY
-# =========================================================
 
 @bot.event
 async def on_ready():
+    log.info("Bot conectado como %s (ID: %s)", bot.user, bot.user.id)
 
-    print(
-        f"✅ Bot online: {bot.user} | ID: {bot.user.id}"
+
+@bot.event
+async def on_message(message: discord.Message):
+    global ACTIVE_DROP
+
+    if message.author.bot:
+        return
+
+    if ACTIVE_DROP and not ACTIVE_DROP["finalizado"] and message.channel.id == ACTIVE_DROP["canal_id"]:
+        if normalizar(message.content) == ACTIVE_DROP["resposta_normalizada"]:
+            ACTIVE_DROP["finalizado"] = True
+            vencedor = message.author
+
+            await message.channel.send(
+                embed=discord.Embed(
+                    title="🎉  DROP VENCIDO!",
+                    description=f"### {vencedor.mention} acertou! A resposta era **{ACTIVE_DROP['resposta']}**",
+                    color=discord.Color.from_rgb(46, 204, 113),
+                )
+            )
+
+            role_ids = DADOS["config"]["drop"].get("reward_role_ids", [])
+            roles = [message.guild.get_role(rid) for rid in role_ids]
+            roles = [r for r in roles if r]
+
+            try:
+                if roles:
+                    dm_embed = discord.Embed(
+                        title="🏆 Você venceu o Drop!",
+                        description="Escolha um dos cargos abaixo como sua recompensa:",
+                        color=discord.Color.gold(),
+                    )
+                    await vencedor.send(embed=dm_embed, view=DropRewardView(vencedor.id, roles))
+                else:
+                    await vencedor.send(
+                        "🏆 Você venceu o Drop, mas nenhum cargo de recompensa está configurado ainda. "
+                        "Fale com a staff!"
+                    )
+            except discord.Forbidden:
+                await message.channel.send(
+                    f"⚠️ {vencedor.mention}, não consegui te enviar DM. Habilite mensagens diretas do servidor!"
+                )
+
+            ACTIVE_DROP = None
+
+
+# ============================================================
+#  SISTEMA DE TICKETS
+# ============================================================
+
+def is_ticket_channel(channel: discord.abc.GuildChannel) -> bool:
+    return isinstance(channel, discord.TextChannel) and channel.name.startswith("ticket-")
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Abrir Ticket", emoji="🎫", style=discord.ButtonStyle.green, custom_id="brs_open_ticket")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        cfg = DADOS["config"]["ticket"]
+        template = cfg.get("channel_name_template") or "ticket-{user}"
+        channel_name = template.replace("{user}", interaction.user.name).lower().replace(" ", "-")[:90]
+        if not channel_name.startswith("ticket-"):
+            channel_name = f"ticket-{channel_name}"[:90]
+
+        existing = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing:
+            await interaction.response.send_message(
+                f"❌ Você já possui um ticket aberto: {existing.mention}", ephemeral=True
+            )
+            return
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_channels=True
+            ),
+        }
+        for rid in cfg.get("staff_role_ids", []):
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                )
+
+        category = guild.get_channel(cfg.get("category_id")) if cfg.get("category_id") else None
+
+        ticket_channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            reason=f"Ticket aberto por {interaction.user} ({interaction.user.id})",
+        )
+
+        mensagem = (cfg.get("welcome_message") or "Olá {mention}, seja bem-vindo(a)!")
+        mensagem = mensagem.replace("{mention}", interaction.user.mention).replace("{user}", interaction.user.display_name)
+
+        embed = discord.Embed(
+            title="🎫 Ticket — BRS",
+            description=mensagem,
+            color=EMBED_COLOR,
+            timestamp=datetime.datetime.now(),
+        )
+        embed.set_footer(text=f"Aberto por {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
+        await ticket_channel.send(content=interaction.user.mention, embed=embed, view=TicketControlView())
+
+        log_id = cfg.get("log_channel_id")
+        if log_id:
+            log_channel = guild.get_channel(log_id)
+            if log_channel:
+                await log_channel.send(
+                    embed=discord.Embed(
+                        description=f"🎫 Ticket aberto: {ticket_channel.mention} por {interaction.user.mention}",
+                        color=discord.Color.green(),
+                    )
+                )
+
+        await interaction.response.send_message(f"✅ Ticket criado: {ticket_channel.mention}", ephemeral=True)
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Fechar Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id="brs_close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_ticket_channel(interaction.channel):
+            await interaction.response.send_message(
+                "❌ Este botão só funciona dentro de um canal de ticket.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message("🔒 Fechando o ticket em 5 segundos...", ephemeral=True)
+
+        cfg = DADOS["config"]["ticket"]
+        log_id = cfg.get("log_channel_id")
+        if log_id:
+            log_channel = interaction.guild.get_channel(log_id)
+            if log_channel:
+                await log_channel.send(
+                    embed=discord.Embed(
+                        description=f"🔒 Ticket fechado: `{interaction.channel.name}` por {interaction.user.mention}",
+                        color=discord.Color.red(),
+                    )
+                )
+
+        await interaction.channel.send(f"🔒 Ticket fechado por {interaction.user.mention}. Encerrando em 5 segundos...")
+        await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
+        await interaction.channel.delete(reason=f"Ticket fechado por {interaction.user}")
+
+
+ticket_group = app_commands.Group(name="ticket", description="Sistema de tickets da BRS")
+
+
+@ticket_group.command(name="configurar", description="Configura o sistema de tickets.")
+@app_commands.describe(
+    categoria="Categoria onde os tickets serão criados",
+    cargo_staff="Cargo com acesso aos tickets (chame de novo para adicionar mais de um)",
+    nome_canal="Modelo do nome do canal (use {user})",
+    mensagem="Mensagem inicial enviada no ticket (use {mention} para marcar quem abriu)",
+    canal_logs="Canal onde logs de abertura/fechamento serão enviados",
+)
+async def ticket_configurar(
+    interaction: discord.Interaction,
+    categoria: Optional[discord.CategoryChannel] = None,
+    cargo_staff: Optional[discord.Role] = None,
+    nome_canal: Optional[str] = None,
+    mensagem: Optional[str] = None,
+    canal_logs: Optional[discord.TextChannel] = None,
+):
+    if not await checar_permissao(interaction, "ticket"):
+        return
+
+    cfg = DADOS["config"]["ticket"]
+    alterado = []
+    if categoria:
+        cfg["category_id"] = categoria.id
+        alterado.append(f"📁 Categoria: **{categoria.name}**")
+    if cargo_staff:
+        if cargo_staff.id not in cfg["staff_role_ids"]:
+            cfg["staff_role_ids"].append(cargo_staff.id)
+        alterado.append(f"🛡️ Cargo staff adicionado: **{cargo_staff.name}**")
+    if nome_canal:
+        cfg["channel_name_template"] = nome_canal
+        alterado.append(f"🏷️ Nome do canal: `{nome_canal}`")
+    if mensagem:
+        cfg["welcome_message"] = mensagem
+        alterado.append("💬 Mensagem inicial atualizada")
+    if canal_logs:
+        cfg["log_channel_id"] = canal_logs.id
+        alterado.append(f"📜 Canal de logs: {canal_logs.mention}")
+
+    salvar_dados(DADOS)
+
+    if not alterado:
+        await interaction.response.send_message("ℹ️ Nenhuma alteração enviada.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "✅ Configuração de tickets atualizada:\n" + "\n".join(f"• {a}" for a in alterado), ephemeral=True
     )
 
 
-# =========================================================
-# INICIAR
-# =========================================================
-
-if not TOKEN:
-    raise SystemExit(
-        "❌ DISCORD_TOKEN não encontrado."
+@ticket_group.command(name="painel", description="Envia o painel de abertura de tickets.")
+@app_commands.describe(canal="Canal onde o painel será enviado (padrão: canal atual)")
+async def ticket_painel(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
+    if not await checar_permissao(interaction, "ticket"):
+        return
+    canal = canal or interaction.channel
+    embed = discord.Embed(
+        title="🎫  Central de Atendimento — BRS",
+        description="Clique no botão abaixo para abrir um ticket com a nossa staff.",
+        color=EMBED_COLOR,
     )
+    await canal.send(embed=embed, view=TicketPanelView())
+    await interaction.response.send_message(f"✅ Painel enviado em {canal.mention}.", ephemeral=True)
 
-bot.run(TOKEN)
+
+@ticket_group.command(name="add", description="Adiciona um membro ou cargo ao ticket atual.")
+@app_commands.describe(alvo="Membro ou cargo a ser adicionado ao ticket")
+async def ticket_add(interaction: discord.Interaction, alvo: Union[discord.Member, discord.Role]):
+    if not is_ticket_channel(interaction.channel):
+        await interaction.response.send_message(
+            "❌ Este comando só pode ser usado dentro de um canal de ticket.", ephemeral=True
+        )
+        return
+    await interaction.channel.set_permissions(alvo, view_channel=True, send_messages=True, read_message_history=True)
+    await interaction.response.send_message(f"✅ {alvo.mention} foi adicionado(a) ao ticket.", ephemeral=True)
+    await interaction.channel.send(f"➕ {alvo.mention} foi adicionado(a) ao ticket por {interaction.user.mention}.")
+
+
+@ticket_group.command(name="remove", description="Remove um membro ou cargo do ticket atual.")
+@app_commands.describe(alvo="Membro ou cargo a ser removido do ticket")
+async def ticket_remove(interaction: discord.Interaction, alvo: Union[discord.Member, discord.Role]):
+    if not is_ticket_channel(interaction.channel):
+        await interaction.response.send_message(
+            "❌ Este comando só pode ser usado dentro de um canal de ticket.", ephemeral=True
+        )
+        return
+    await interaction.channel.set_permissions(alvo, overwrite=None)
+    await interaction.response.send_message(f"✅ {alvo.mention} foi removido(a) do ticket.", ephemeral=True)
+    await interaction.channel.send(f"➖ {alvo.mention} foi removido(a) do ticket por {interaction.user.mention}.")
+
+
+# ============================================================
+#  /drop — PERGUNTAS E RESPOSTAS COM PRÊMIO
+# ============================================================
+
+class DropRewardButton(discord.ui.Button):
+    def __init__(self, role: discord.Role):
+        super().__init__(label=role.name[:80], style=discord.ButtonStyle.blurple, emoji="🏅")
+        self.role = role
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "DropRewardView" = self.view
+        if interaction.user.id != view.user_id:
+            await interaction.response.send_message("❌ Essa recompensa não é sua.", ephemeral=True)
+            return
+
+        guild = bot.get_guild(GUILD_ID)
+        member = guild.get_member(view.user_id) if guild else None
+        if not (guild and member):
+            await interaction.response.send_message("❌ Não consegui aplicar o cargo. Fale com a staff.", ephemeral=True)
+            return
+
+        await member.add_roles(self.role, reason="Recompensa do Drop")
+        for item in view.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=f"✅ Você recebeu o cargo **{self.role.name}**!", view=view)
+        view.stop()
+
+
+class DropRewardView(discord.ui.View):
+    def __init__(self, user_id: int, roles: list[discord.Role]):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        for role in roles[:25]:
+            self.add_item(DropRewardButton(role))
+
+
+drop_group = app_commands.Group(name="drop", description="Sistema de Drops (perguntas e respostas) da BRS")
+
+
+@drop_group.command(name="iniciar", description="Inicia um novo Drop com pergunta e resposta.")
+@app_commands.describe(
+    pergunta="A pergunta do Drop",
+    resposta="A resposta correta",
+    canal="Canal onde o Drop será postado (padrão: canal configurado ou atual)",
+)
+async def drop_iniciar(
+    interaction: discord.Interaction, pergunta: str, resposta: str, canal: Optional[discord.TextChannel] = None
+):
+    if not await checar_permissao(interaction, "drop"):
+        return
+
+    global ACTIVE_DROP
+    if ACTIVE_DROP and not ACTIVE_DROP["finalizado"]:
+        await interaction.response.send_message(
+            "❌ Já existe um Drop em andamento. Use `/drop cancelar` primeiro.", ephemeral=True
+        )
+        return
+
+    canal_destino = canal
+    if not canal_destino:
+        canal_id = DADOS["config"]["drop"].get("default_channel_id")
+        if canal_id:
+            canal_destino = interaction.guild.get_channel(canal_id)
+    canal_destino = canal_destino or interaction.channel
+
+    ACTIVE_DROP = {
+        "pergunta": pergunta,
+        "resposta": resposta,
+        "resposta_normalizada": normalizar(resposta),
+        "canal_id": canal_destino.id,
+        "finalizado": False,
+    }
+
+    embed = discord.Embed(
+        title="❓  DROP — BRS",
+        description=f"### {pergunta}\n\nResponda no chat! Quem acertar primeiro leva o prêmio 🏆",
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Boa sorte!")
+    await canal_destino.send(embed=embed)
+    await interaction.response.send_message(f"✅ Drop iniciado em {canal_destino.mention}.", ephemeral=True)
+
+
+@drop_group.command(name="cancelar", description="Cancela o Drop em andamento.")
+async def drop_cancelar(interaction: discord.Interaction):
+    if not await checar_permissao(interaction, "drop"):
+        return
+
+    global ACTIVE_DROP
+    if not ACTIVE_DROP or ACTIVE_DROP["finalizado"]:
+        await interaction.response.send_message("ℹ️ Não há nenhum Drop em andamento.", ephemeral=True)
+        return
+
+    canal = interaction.guild.get_channel(ACTIVE_DROP["canal_id"])
+    ACTIVE_DROP = None
+    if canal:
+        await canal.send("🚫 O Drop foi cancelado pela staff.")
+    await interaction.response.send_message("✅ Drop cancelado.", ephemeral=True)
+
+
+@drop_group.command(name="premio_adicionar", description="Adiciona um cargo à lista de prêmios do Drop.")
+@app_commands.describe(cargo="Cargo a adicionar como prêmio")
+async def drop_premio_adicionar(interaction: discord.Interaction, cargo: discord.Role):
+    if not await checar_permissao(interaction, "drop"):
+        return
+    lst = DADOS["config"]["drop"]["reward_role_ids"]
+    if cargo.id not in lst:
+        lst.append(cargo.id)
+        salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Cargo **{cargo.name}** adicionado aos prêmios do Drop.", ephemeral=True)
+
+
+@drop_group.command(name="premio_remover", description="Remove um cargo da lista de prêmios do Drop.")
+@app_commands.describe(cargo="Cargo a remover dos prêmios")
+async def drop_premio_remover(interaction: discord.Interaction, cargo: discord.Role):
+    if not await checar_permissao(interaction, "drop"):
+        return
+    lst = DADOS["config"]["drop"]["reward_role_ids"]
+    if cargo.id in lst:
+        lst.remove(cargo.id)
+        salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Cargo **{cargo.name}** removido dos prêmios do Drop.", ephemeral=True)
+
+
+@drop_group.command(name="canal_padrao", description="Define o canal padrão onde os Drops serão postados.")
+@app_commands.describe(canal="Canal padrão para os Drops")
+async def drop_canal_padrao(interaction: discord.Interaction, canal: discord.TextChannel):
+    if not await checar_permissao(interaction, "drop"):
+        return
+    DADOS["config"]["drop"]["default_channel_id"] = canal.id
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Canal padrão do Drop definido: {canal.mention}", ephemeral=True)
+
+
+# ============================================================
+#  /freeagent — CRUD de Free Agents
+# ============================================================
+
+def embed_freeagent(jogador_id: int, dados_jogador: dict, guild: discord.Guild) -> discord.Embed:
+    membro = guild.get_member(jogador_id)
+    embed = discord.Embed(
+        title="🆓  FREE AGENT",
+        description=f"### {membro.mention if membro else 'Jogador'}",
+        color=discord.Color.from_rgb(52, 152, 219),
+        timestamp=datetime.datetime.fromisoformat(dados_jogador["data"]),
+    )
+    embed.add_field(name="⚽ Posição", value=f"```{dados_jogador['posicao']}```", inline=True)
+    embed.add_field(name="📝 Descrição", value=dados_jogador["descricao"], inline=False)
+    if dados_jogador.get("imagem"):
+        embed.set_image(url=dados_jogador["imagem"])
+    if membro:
+        embed.set_thumbnail(url=membro.display_avatar.url)
+    embed.set_footer(text="BRS • Free Agents")
+    return embed
+
+
+freeagent_group = app_commands.Group(name="freeagent", description="Sistema de Free Agents da BRS")
+
+
+@freeagent_group.command(name="add", description="Cadastra um jogador como Free Agent.")
+@app_commands.describe(
+    jogador="Jogador", posicao="Posição (ex: ST, CM, GK)", descricao="Descrição do jogador",
+    imagem="URL de uma imagem/avatar (opcional)",
+)
+async def freeagent_add(
+    interaction: discord.Interaction, jogador: discord.Member, posicao: str, descricao: str,
+    imagem: Optional[str] = None,
+):
+    if not await checar_permissao(interaction, "freeagent"):
+        return
+    registro = {"posicao": posicao, "descricao": descricao, "imagem": imagem, "data": datetime.datetime.now().isoformat()}
+    DADOS["freeagents"][str(jogador.id)] = registro
+    salvar_dados(DADOS)
+
+    canal_id = DADOS["config"]["freeagent"].get("channel_id")
+    canal = interaction.guild.get_channel(canal_id) if canal_id else None
+    canal = canal or interaction.channel
+
+    embed = embed_freeagent(jogador.id, registro, interaction.guild)
+    await canal.send(embed=embed)
+    await interaction.response.send_message(f"✅ {jogador.mention} cadastrado como Free Agent em {canal.mention}.", ephemeral=True)
+
+
+@freeagent_group.command(name="remover", description="Remove um jogador da lista de Free Agents.")
+@app_commands.describe(jogador="Jogador a remover")
+async def freeagent_remover(interaction: discord.Interaction, jogador: discord.Member):
+    if not await checar_permissao(interaction, "freeagent"):
+        return
+    if str(jogador.id) not in DADOS["freeagents"]:
+        await interaction.response.send_message("❌ Esse jogador não está cadastrado como Free Agent.", ephemeral=True)
+        return
+    del DADOS["freeagents"][str(jogador.id)]
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ {jogador.mention} removido dos Free Agents.", ephemeral=True)
+
+
+@freeagent_group.command(name="editar", description="Edita as informações de um Free Agent.")
+@app_commands.describe(
+    jogador="Jogador", posicao="Nova posição (opcional)", descricao="Nova descrição (opcional)",
+    imagem="Nova imagem (opcional)",
+)
+async def freeagent_editar(
+    interaction: discord.Interaction, jogador: discord.Member, posicao: Optional[str] = None,
+    descricao: Optional[str] = None, imagem: Optional[str] = None,
+):
+    if not await checar_permissao(interaction, "freeagent"):
+        return
+    registro = DADOS["freeagents"].get(str(jogador.id))
+    if not registro:
+        await interaction.response.send_message("❌ Esse jogador não está cadastrado como Free Agent.", ephemeral=True)
+        return
+    if posicao:
+        registro["posicao"] = posicao
+    if descricao:
+        registro["descricao"] = descricao
+    if imagem:
+        registro["imagem"] = imagem
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Free Agent {jogador.mention} atualizado.", ephemeral=True)
+
+
+@freeagent_group.command(name="buscar", description="Mostra os dados de um Free Agent específico.")
+@app_commands.describe(jogador="Jogador a buscar")
+async def freeagent_buscar(interaction: discord.Interaction, jogador: discord.Member):
+    registro = DADOS["freeagents"].get(str(jogador.id))
+    if not registro:
+        await interaction.response.send_message("❌ Esse jogador não está cadastrado como Free Agent.", ephemeral=True)
+        return
+    embed = embed_freeagent(jogador.id, registro, interaction.guild)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@freeagent_group.command(name="lista", description="Lista todos os Free Agents cadastrados.")
+async def freeagent_lista(interaction: discord.Interaction):
+    itens = DADOS["freeagents"]
+    if not itens:
+        await interaction.response.send_message("ℹ️ Nenhum Free Agent cadastrado no momento.", ephemeral=True)
+        return
+    linhas = []
+    for jid, dj in itens.items():
+        membro = interaction.guild.get_member(int(jid))
+        nome = membro.mention if membro else f"<@{jid}>"
+        linhas.append(f"▸ {nome} — `{dj['posicao']}`")
+    embed = discord.Embed(
+        title="🆓  FREE AGENTS — BRS", description="\n".join(linhas), color=discord.Color.from_rgb(52, 152, 219)
+    )
+    embed.set_footer(text=f"Total: {len(itens)} jogador(es)")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@freeagent_group.command(name="canal", description="Define o canal onde os Free Agents serão publicados.")
+@app_commands.describe(canal="Canal de publicação")
+async def freeagent_canal(interaction: discord.Interaction, canal: discord.TextChannel):
+    if not await checar_permissao(interaction, "freeagent"):
+        return
+    DADOS["config"]["freeagent"]["channel_id"] = canal.id
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Canal de Free Agents definido: {canal.mention}", ephemeral=True)
+
+
+# ============================================================
+#  /scouting — CRUD de Scouting Reports
+# ============================================================
+
+STATUS_CHOICES = [
+    app_commands.Choice(name="Em avaliação", value="Em avaliação"),
+    app_commands.Choice(name="Aprovado", value="Aprovado"),
+    app_commands.Choice(name="Reprovado", value="Reprovado"),
+    app_commands.Choice(name="Monitorando", value="Monitorando"),
+]
+
+STATUS_CORES = {
+    "Em avaliação": discord.Color.gold(),
+    "Aprovado": discord.Color.green(),
+    "Reprovado": discord.Color.red(),
+    "Monitorando": discord.Color.blurple(),
+}
+
+
+def embed_scouting(jogador_id: int, dj: dict, guild: discord.Guild) -> discord.Embed:
+    membro = guild.get_member(jogador_id)
+    embed = discord.Embed(
+        title="🔍  SCOUTING REPORT",
+        description=f"### {membro.mention if membro else 'Jogador'}",
+        color=STATUS_CORES.get(dj["status"], discord.Color(EMBED_COLOR)),
+        timestamp=datetime.datetime.fromisoformat(dj["data"]),
+    )
+    embed.add_field(name="⚽ Posição", value=f"```{dj['posicao']}```", inline=True)
+    embed.add_field(name="📌 Status", value=f"```{dj['status']}```", inline=True)
+    embed.add_field(name="📝 Descrição", value=dj["descricao"], inline=False)
+    if dj.get("observacoes"):
+        embed.add_field(name="🔎 Observações do Scout", value=dj["observacoes"], inline=False)
+    if membro:
+        embed.set_thumbnail(url=membro.display_avatar.url)
+    embed.set_footer(text="BRS • Scouting")
+    return embed
+
+
+scouting_group = app_commands.Group(name="scouting", description="Sistema de Scouting da BRS")
+
+
+@scouting_group.command(name="add", description="Cadastra um relatório de Scouting.")
+@app_commands.describe(
+    jogador="Jogador", posicao="Posição", descricao="Descrição do jogador",
+    observacoes="Observações do Scout (opcional)", status="Status do scouting (padrão: Em avaliação)",
+)
+@app_commands.choices(status=STATUS_CHOICES)
+async def scouting_add(
+    interaction: discord.Interaction, jogador: discord.Member, posicao: str, descricao: str,
+    observacoes: Optional[str] = None, status: Optional[app_commands.Choice[str]] = None,
+):
+    if not await checar_permissao(interaction, "scouting"):
+        return
+    registro = {
+        "posicao": posicao, "descricao": descricao, "observacoes": observacoes or "",
+        "status": status.value if status else "Em avaliação", "data": datetime.datetime.now().isoformat(),
+    }
+    DADOS["scoutings"][str(jogador.id)] = registro
+    salvar_dados(DADOS)
+
+    canal_id = DADOS["config"]["scouting"].get("channel_id")
+    canal = interaction.guild.get_channel(canal_id) if canal_id else None
+    canal = canal or interaction.channel
+
+    embed = embed_scouting(jogador.id, registro, interaction.guild)
+    await canal.send(embed=embed)
+    await interaction.response.send_message(f"✅ Scouting de {jogador.mention} cadastrado em {canal.mention}.", ephemeral=True)
+
+
+@scouting_group.command(name="editar", description="Edita um relatório de Scouting.")
+@app_commands.describe(
+    jogador="Jogador", posicao="Nova posição (opcional)", descricao="Nova descrição (opcional)",
+    observacoes="Novas observações (opcional)",
+)
+async def scouting_editar(
+    interaction: discord.Interaction, jogador: discord.Member, posicao: Optional[str] = None,
+    descricao: Optional[str] = None, observacoes: Optional[str] = None,
+):
+    if not await checar_permissao(interaction, "scouting"):
+        return
+    registro = DADOS["scoutings"].get(str(jogador.id))
+    if not registro:
+        await interaction.response.send_message("❌ Esse jogador não tem scouting cadastrado.", ephemeral=True)
+        return
+    if posicao:
+        registro["posicao"] = posicao
+    if descricao:
+        registro["descricao"] = descricao
+    if observacoes:
+        registro["observacoes"] = observacoes
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Scouting de {jogador.mention} atualizado.", ephemeral=True)
+
+
+@scouting_group.command(name="status", description="Altera o status de um scouting.")
+@app_commands.describe(jogador="Jogador", status="Novo status")
+@app_commands.choices(status=STATUS_CHOICES)
+async def scouting_status(interaction: discord.Interaction, jogador: discord.Member, status: app_commands.Choice[str]):
+    if not await checar_permissao(interaction, "scouting"):
+        return
+    registro = DADOS["scoutings"].get(str(jogador.id))
+    if not registro:
+        await interaction.response.send_message("❌ Esse jogador não tem scouting cadastrado.", ephemeral=True)
+        return
+    registro["status"] = status.value
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Status de {jogador.mention} alterado para **{status.value}**.", ephemeral=True)
+
+
+@scouting_group.command(name="remover", description="Remove um relatório de Scouting.")
+@app_commands.describe(jogador="Jogador")
+async def scouting_remover(interaction: discord.Interaction, jogador: discord.Member):
+    if not await checar_permissao(interaction, "scouting"):
+        return
+    if str(jogador.id) not in DADOS["scoutings"]:
+        await interaction.response.send_message("❌ Esse jogador não tem scouting cadastrado.", ephemeral=True)
+        return
+    del DADOS["scoutings"][str(jogador.id)]
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Scouting de {jogador.mention} removido.", ephemeral=True)
+
+
+@scouting_group.command(name="buscar", description="Mostra o relatório de Scouting de um jogador.")
+@app_commands.describe(jogador="Jogador")
+async def scouting_buscar(interaction: discord.Interaction, jogador: discord.Member):
+    registro = DADOS["scoutings"].get(str(jogador.id))
+    if not registro:
+        await interaction.response.send_message("❌ Esse jogador não tem scouting cadastrado.", ephemeral=True)
+        return
+    embed = embed_scouting(jogador.id, registro, interaction.guild)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@scouting_group.command(name="lista", description="Lista todos os relatórios de Scouting.")
+async def scouting_lista(interaction: discord.Interaction):
+    itens = DADOS["scoutings"]
+    if not itens:
+        await interaction.response.send_message("ℹ️ Nenhum scouting cadastrado no momento.", ephemeral=True)
+        return
+    linhas = []
+    for jid, dj in itens.items():
+        membro = interaction.guild.get_member(int(jid))
+        nome = membro.mention if membro else f"<@{jid}>"
+        linhas.append(f"▸ {nome} — `{dj['posicao']}` — **{dj['status']}**")
+    embed = discord.Embed(
+        title="🔍  SCOUTING — BRS", description="\n".join(linhas), color=discord.Color.from_rgb(241, 196, 15)
+    )
+    embed.set_footer(text=f"Total: {len(itens)} jogador(es)")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@scouting_group.command(name="canal", description="Define o canal onde os relatórios de Scouting serão publicados.")
+@app_commands.describe(canal="Canal de publicação")
+async def scouting_canal(interaction: discord.Interaction, canal: discord.TextChannel):
+    if not await checar_permissao(interaction, "scouting"):
+        return
+    DADOS["config"]["scouting"]["channel_id"] = canal.id
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Canal de Scouting definido: {canal.mention}", ephemeral=True)
+
+
+# ============================================================
+#  /say  e  /say_embed
+# ============================================================
+
+@bot.tree.command(name="say", description="Envia uma mensagem de texto através do bot.", guild=GUILD)
+@app_commands.describe(mensagem="Texto a ser enviado", canal="Canal de destino (padrão: canal atual)")
+async def say_cmd(interaction: discord.Interaction, mensagem: str, canal: Optional[discord.TextChannel] = None):
+    if not await checar_permissao(interaction, "say"):
+        return
+    canal = canal or interaction.channel
+    await canal.send(mensagem.replace("\\n", "\n"))
+    await interaction.response.send_message(f"✅ Mensagem enviada em {canal.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="say_embed", description="Envia uma mensagem em formato de embed através do bot.", guild=GUILD)
+@app_commands.describe(
+    titulo="Título do embed", descricao="Descrição do embed (use \\n para quebrar linha)",
+    canal="Canal de destino (padrão: canal atual)", cor="Cor em hexadecimal, ex: #FF0000",
+    imagem="URL de uma imagem grande", thumbnail="URL de uma imagem pequena (miniatura)",
+    rodape="Texto do rodapé", autor="Nome do autor exibido no topo do embed",
+)
+async def say_embed_cmd(
+    interaction: discord.Interaction, titulo: str, descricao: str, canal: Optional[discord.TextChannel] = None,
+    cor: Optional[str] = None, imagem: Optional[str] = None, thumbnail: Optional[str] = None,
+    rodape: Optional[str] = None, autor: Optional[str] = None,
+):
+    if not await checar_permissao(interaction, "say_embed"):
+        return
+    canal = canal or interaction.channel
+
+    if cor:
+        try:
+            color = discord.Color(int(cor.replace("#", ""), 16))
+        except ValueError:
+            await interaction.response.send_message("❌ Cor inválida. Use um código hexadecimal, ex: #FF0000", ephemeral=True)
+            return
+    else:
+        color = discord.Color(EMBED_COLOR)
+
+    embed = discord.Embed(title=titulo, description=descricao.replace("\\n", "\n"), color=color)
+    if imagem:
+        embed.set_image(url=imagem)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    if rodape:
+        embed.set_footer(text=rodape)
+    if autor:
+        embed.set_author(name=autor)
+
+    await canal.send(embed=embed)
+    await interaction.response.send_message(f"✅ Embed enviado em {canal.mention}.", ephemeral=True)
+
+
+# ============================================================
+#  PERMISSÕES E CONFIGURAÇÃO GERAL
+# ============================================================
+
+COMANDOS_CONFIGURAVEIS = [
+    app_commands.Choice(name="ticket", value="ticket"),
+    app_commands.Choice(name="drop", value="drop"),
+    app_commands.Choice(name="freeagent", value="freeagent"),
+    app_commands.Choice(name="scouting", value="scouting"),
+    app_commands.Choice(name="say", value="say"),
+    app_commands.Choice(name="say_embed", value="say_embed"),
+]
+
+ACAO_CHOICES = [
+    app_commands.Choice(name="Adicionar", value="adicionar"),
+    app_commands.Choice(name="Remover", value="remover"),
+]
+
+
+@bot.tree.command(name="staff", description="Define um cargo como Staff geral (acesso a todos os comandos).", guild=GUILD)
+@app_commands.describe(cargo="Cargo de staff", acao="Adicionar ou remover")
+@app_commands.choices(acao=ACAO_CHOICES)
+@app_commands.checks.has_permissions(administrator=True)
+async def staff_cmd(interaction: discord.Interaction, cargo: discord.Role, acao: app_commands.Choice[str]):
+    lst = DADOS["config"]["staff_role_ids"]
+    if acao.value == "adicionar":
+        if cargo.id not in lst:
+            lst.append(cargo.id)
+        msg = f"✅ Cargo **{cargo.name}** agora é Staff geral (acesso a todos os comandos administrativos)."
+    else:
+        if cargo.id in lst:
+            lst.remove(cargo.id)
+        msg = f"✅ Cargo **{cargo.name}** removido da Staff geral."
+    salvar_dados(DADOS)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="permissao", description="Libera/revoga um cargo para usar um comando específico.", guild=GUILD)
+@app_commands.describe(comando="Comando a configurar", cargo="Cargo a liberar/revogar", acao="Adicionar ou remover")
+@app_commands.choices(comando=COMANDOS_CONFIGURAVEIS, acao=ACAO_CHOICES)
+@app_commands.checks.has_permissions(administrator=True)
+async def permissao_cmd(
+    interaction: discord.Interaction, comando: app_commands.Choice[str], cargo: discord.Role,
+    acao: app_commands.Choice[str],
+):
+    lst = DADOS["config"]["command_permissions"].setdefault(comando.value, [])
+    if acao.value == "adicionar":
+        if cargo.id not in lst:
+            lst.append(cargo.id)
+        msg = f"✅ Cargo **{cargo.name}** agora pode usar `/{comando.value}`."
+    else:
+        if cargo.id in lst:
+            lst.remove(cargo.id)
+        msg = f"✅ Cargo **{cargo.name}** não pode mais usar `/{comando.value}`."
+    salvar_dados(DADOS)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="config_ver", description="Mostra as configurações atuais do bot.", guild=GUILD)
+@app_commands.checks.has_permissions(administrator=True)
+async def config_ver_cmd(interaction: discord.Interaction):
+    cfg = DADOS["config"]
+    guild = interaction.guild
+
+    def nomes_cargos(ids):
+        nomes = [guild.get_role(i).name for i in ids if guild.get_role(i)]
+        return ", ".join(nomes) if nomes else "nenhum"
+
+    def nome_canal(cid):
+        c = guild.get_channel(cid) if cid else None
+        return c.mention if c else "não definido"
+
+    embed = discord.Embed(title="⚙️  Configurações — BRS Bot", color=EMBED_COLOR)
+    embed.add_field(name="🛡️ Staff geral", value=nomes_cargos(cfg["staff_role_ids"]), inline=False)
+    for cmd_nome, ids in cfg["command_permissions"].items():
+        embed.add_field(name=f"/{cmd_nome}", value=nomes_cargos(ids), inline=True)
+    embed.add_field(name="🎫 Ticket — categoria", value=nome_canal(cfg["ticket"]["category_id"]), inline=True)
+    embed.add_field(name="🎫 Ticket — cargos", value=nomes_cargos(cfg["ticket"]["staff_role_ids"]), inline=True)
+    embed.add_field(name="🎫 Ticket — logs", value=nome_canal(cfg["ticket"]["log_channel_id"]), inline=True)
+    embed.add_field(name="❓ Drop — prêmios", value=nomes_cargos(cfg["drop"]["reward_role_ids"]), inline=True)
+    embed.add_field(name="❓ Drop — canal padrão", value=nome_canal(cfg["drop"]["default_channel_id"]), inline=True)
+    embed.add_field(name="🆓 Free Agent — canal", value=nome_canal(cfg["freeagent"]["channel_id"]), inline=True)
+    embed.add_field(name="🔍 Scouting — canal", value=nome_canal(cfg["scouting"]["channel_id"]), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ============================================================
+#  TRATAMENTO DE ERROS
+# ============================================================
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ Você não tem permissão para usar este comando."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"⏳ Aguarde {error.retry_after:.1f}s para usar este comando novamente."
+    else:
+        msg = "❌ Ocorreu um erro ao executar este comando."
+        log.exception("Erro no comando %s", getattr(interaction.command, "name", "?"), exc_info=error)
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+if __name__ == "__main__":
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if not TOKEN:
+        raise SystemExit(
+            "❌ Defina a variável de ambiente DISCORD_TOKEN (ou crie um arquivo .env) "
+            "com o token do seu bot antes de rodar."
+        )
+    bot.run(TOKEN)
