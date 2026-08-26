@@ -334,12 +334,73 @@ def carregar_dados() -> dict:
     return dados
 
 
+def migrar_sorteios_agendados(dados: dict) -> bool:
+    """Converte eventos antigos agrupados em partidas individuais.
+
+    Eventos antigos guardavam todos os times e um único horário. Eles são
+    transformados em um confronto por registro, com intervalo padrão de um
+    dia e uma hora para que não voltem a ser publicados juntos.
+    """
+    liga = dados.setdefault("liga", {})
+    eventos = liga.setdefault("sorteios", [])
+    novos = []
+    alterou = False
+    for evento in eventos:
+        times = list(evento.get("times", []))
+        if evento.get("status") != "agendado" or evento.get("casa") or evento.get("fora") or len(times) < 2:
+            novos.append(evento)
+            continue
+        try:
+            base = datetime.datetime.fromisoformat(evento["executar_em"])
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=BRT)
+        except (KeyError, TypeError, ValueError):
+            novos.append(evento)
+            continue
+        alterou = True
+        embaralhados = list(times)
+        random.Random(str(evento.get("id", "legacy"))).shuffle(embaralhados)
+        pares = []
+        while len(embaralhados) >= 2:
+            pares.append((embaralhados.pop(0), embaralhados.pop(0)))
+        for indice, (casa, fora) in enumerate(pares):
+            quando = base + datetime.timedelta(days=indice, minutes=60 * indice)
+            novos.append({
+                "id": f"{evento.get('id', 'legacy')}-{indice + 1}",
+                "dia": quando.strftime("%d/%m/%Y"),
+                "horario": quando.strftime("%H:%M"),
+                "executar_em": quando.isoformat(),
+                "canal_id": evento.get("canal_id"),
+                "casa": casa,
+                "fora": fora,
+                "times": [casa, fora],
+                "status": "agendado",
+                "migrado_de": evento.get("id"),
+            })
+        if embaralhados:
+            novos.append({
+                "id": f"{evento.get('id', 'legacy')}-folga",
+                "dia": base.strftime("%d/%m/%Y"),
+                "horario": base.strftime("%H:%M"),
+                "executar_em": base.isoformat(),
+                "canal_id": evento.get("canal_id"),
+                "times": embaralhados,
+                "status": "folga",
+                "migrado_de": evento.get("id"),
+            })
+    if alterou:
+        liga["sorteios"] = novos
+    return alterou
+
+
 def salvar_dados(dados: dict):
     with open(DATA_PATH, "w", encoding="utf-8") as f:
         json.dump(dados, f, ensure_ascii=False, indent=2)
 
 
 DADOS = carregar_dados()
+if migrar_sorteios_agendados(DADOS):
+    salvar_dados(DADOS)
 
 
 def agora_utc() -> datetime.datetime:
@@ -2272,8 +2333,10 @@ async def liga_lista(interaction: discord.Interaction):
 @app_commands.describe(
     dia="Data inicial no formato DD/MM/AAAA",
     horario="Horário inicial no formato HH:MM (BRT)",
-    agenda="Opcional: um horário completo por confronto, separado por ;. Ex: 27/08/2026 20:00;28/08/2026 20:00",
+    agenda="Opcional: um horário completo por confronto, separado por ;",
     canal="Canal onde publicar",
+    intervalo_dias="Dias entre partidas quando agenda não for informada",
+    intervalo_minutos="Minutos adicionais entre partidas quando agenda não for informada",
 )
 async def liga_sortear(
     interaction: discord.Interaction,
@@ -2281,6 +2344,8 @@ async def liga_sortear(
     horario: str,
     agenda: Optional[str] = None,
     canal: Optional[discord.TextChannel] = None,
+    intervalo_dias: int = 1,
+    intervalo_minutos: int = 60,
 ):
     if not await checar_permissao(interaction, "liga"):
         return
@@ -2292,6 +2357,9 @@ async def liga_sortear(
     assinatura_comando = f"{dia.strip()}|{horario.strip()}|{agenda or ''}|{destino.id}|{','.join(sorted(times))}"
     if comando_duplicado(interaction, "liga_sortear", assinatura_comando):
         await interaction.response.send_message("ℹ️ Esse comando de sorteio já foi recebido há poucos segundos; não dupliquei os confrontos.", ephemeral=True)
+        return
+    if intervalo_dias < 0 or intervalo_minutos < 0 or (intervalo_dias == 0 and intervalo_minutos == 0):
+        await interaction.response.send_message("❌ O intervalo precisa ser positivo: use pelo menos 1 dia ou 1 minuto.", ephemeral=True)
         return
     inicio = _parse_data_hora_brt(dia, horario)
     if not inicio:
@@ -2309,7 +2377,7 @@ async def liga_sortear(
     if not agenda:
         horarios = []
         for indice in range(len(pares)):
-            quando = inicio + datetime.timedelta(days=indice)
+            quando = inicio + datetime.timedelta(days=indice * intervalo_dias, minutes=indice * intervalo_minutos)
             horarios.append((quando.strftime("%d/%m/%Y"), quando.strftime("%H:%M"), quando))
     if any(quando <= datetime.datetime.now(BRT) for _, _, quando in horarios):
         await interaction.response.send_message("❌ Todos os horários dos confrontos precisam ser futuros.", ephemeral=True)
@@ -2442,7 +2510,10 @@ async def liga_agenda(interaction: discord.Interaction):
     if not eventos:
         await interaction.response.send_message("ℹ️ Nenhum sorteio agendado.", ephemeral=True)
         return
-    linhas = [f"**{i}.** {e.get('dia')} às {e.get('horario')} (BRT) • <#{e.get('canal_id')}> • {len(e.get('times', []))} times" for i, e in enumerate(eventos, 1)]
+    linhas = [
+        f"**{i}.** ⚽ **{e.get('casa', '—')} × {e.get('fora', '—')}** — {e.get('dia')} às {e.get('horario')} (BRT) • <#{e.get('canal_id')}>"
+        for i, e in enumerate(eventos, 1)
+    ]
     await interaction.response.send_message(embed=discord.Embed(title="📅 Agenda de confrontos", description="\n".join(linhas), color=BRS_GREEN), ephemeral=True)
 
 
