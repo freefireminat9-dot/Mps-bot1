@@ -80,6 +80,7 @@ ACTIVE_DROP: Optional[dict] = None
 WAVE_RUNNING = False
 BRT = ZoneInfo("America/Sao_Paulo")
 _CRIANDO_TICKETS: set[int] = set()
+_ULTIMOS_COMANDOS: dict[tuple[int, int, str, str], datetime.datetime] = {}
 
 # Anti-spam: segunda repetição idêntica em até 60 segundos gera timeout de 5 minutos.
 _ULTIMA_MENSAGEM: dict[tuple[int, int], tuple[str, object]] = {}
@@ -447,6 +448,15 @@ async def moderar_repeticao(message: discord.Message) -> bool:
 def normalizar(texto: str) -> str:
     texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
     return texto.strip().lower()
+
+
+def comando_duplicado(interaction: discord.Interaction, nome: str, assinatura: str, janela: int = 15) -> bool:
+    """Bloqueia o mesmo comando repetido rapidamente pelo mesmo membro."""
+    agora = agora_utc()
+    chave = (interaction.guild_id or 0, interaction.user.id, nome, assinatura)
+    anterior = _ULTIMOS_COMANDOS.get(chave)
+    _ULTIMOS_COMANDOS[chave] = agora
+    return bool(anterior and (agora - anterior).total_seconds() < janela)
 
 
 def tem_permissao(member: discord.Member, comando: str) -> bool:
@@ -2126,36 +2136,46 @@ def _parse_agenda_liga(agenda: Optional[str]) -> list[tuple[str, str, datetime.d
 
 
 async def publicar_sorteio_liga(evento: dict):
+    """Publica sempre uma partida por embed; registros antigos agrupados são divididos."""
     guild = bot.get_guild(GUILD_ID)
     canal = guild.get_channel(evento.get("canal_id")) if guild else None
     if not canal:
         return False
-    if evento.get("casa") and evento.get("fora"):
-        confrontos = [f"⚽ **{evento['casa']}**  ×  **{evento['fora']}**"]
-        titulo = "⚽ PARTIDA AGENDADA — BRS"
-    else:
+
+    # Compatibilidade com agendamentos antigos que guardavam todos os times juntos.
+    if not (evento.get("casa") and evento.get("fora")) and len(evento.get("times", [])) >= 2:
         times = list(evento.get("times", []))
         random.shuffle(times)
-        confrontos = []
+        pares = []
         while len(times) >= 2:
-            a, b = times.pop(0), times.pop(0)
-            confrontos.append(f"⚽ **{a}**  ×  **{b}**")
+            pares.append((times.pop(0), times.pop(0)))
+        for casa, fora in pares:
+            await publicar_sorteio_liga({
+                "canal_id": evento.get("canal_id"),
+                "dia": evento.get("dia", "—"),
+                "horario": evento.get("horario", "—"),
+                "casa": casa,
+                "fora": fora,
+                "times": [casa, fora],
+            })
         if times:
-            confrontos.append(f"🟡 **{times[0]}** — folga nesta rodada")
-        titulo = "🎲 SORTEIO DE CONFRONTOS — BRS"
+            await canal.send(f"🟡 **{times[0]}** ficou de folga nesta rodada.")
+        return True
+
+    confronto = f"⚽ **{evento.get('casa', '—')}**  ×  **{evento.get('fora', '—')}**"
     embed = discord.Embed(
-        title=titulo,
-        description="\n".join(confrontos) or "Nenhum confronto gerado.",
+        title="⚽ PARTIDA AGENDADA — BRS",
+        description=confronto,
         color=BRS_GREEN,
         timestamp=agora_utc(),
     )
     embed.add_field(name="📅 Dia", value=evento.get("dia", "—"), inline=True)
     embed.add_field(name="⏰ Horário", value=f"{evento.get('horario', '—')} (BRT)", inline=True)
-    embed.add_field(name="👥 Times", value=str(len(evento.get("times", []))), inline=True)
+    embed.add_field(name="📍 Formato", value="Confronto individual", inline=True)
     avatar = bot_avatar_url()
     if avatar:
         embed.set_thumbnail(url=avatar)
-    embed.set_footer(text="BRS • Sorteio de confrontos")
+    embed.set_footer(text="BRS • Partida individual")
     await canal.send(embed=embed)
     return True
 
@@ -2268,6 +2288,11 @@ async def liga_sortear(
     if len(times) < 2:
         await interaction.response.send_message("❌ Cadastre pelo menos 2 times em `/liga times` antes de sortear.", ephemeral=True)
         return
+    destino = canal or interaction.channel
+    assinatura_comando = f"{dia.strip()}|{horario.strip()}|{agenda or ''}|{destino.id}|{','.join(sorted(times))}"
+    if comando_duplicado(interaction, "liga_sortear", assinatura_comando):
+        await interaction.response.send_message("ℹ️ Esse comando de sorteio já foi recebido há poucos segundos; não dupliquei os confrontos.", ephemeral=True)
+        return
     inicio = _parse_data_hora_brt(dia, horario)
     if not inicio:
         await interaction.response.send_message("❌ Data/horário inválidos. Use `27/08/2026` e `20:00`.", ephemeral=True)
@@ -2290,9 +2315,9 @@ async def liga_sortear(
         await interaction.response.send_message("❌ Todos os horários dos confrontos precisam ser futuros.", ephemeral=True)
         return
 
-    destino = canal or interaction.channel
+    times_cadastrados = list(_times_liga())
     lote_base = "|".join([
-        str(destino.id), dia.strip(), horario.strip(), agenda or "", ",".join(sorted(times)),
+        str(destino.id), dia.strip(), horario.strip(), agenda or "", ",".join(sorted(times_cadastrados)),
     ])
     lote_id = hashlib.sha256(lote_base.encode("utf-8")).hexdigest()[:24]
     if any(e.get("status") == "agendado" and e.get("lote_id") == lote_id for e in DADOS["liga"].get("sorteios", [])):
@@ -2335,7 +2360,7 @@ async def liga_sortear(
     await interaction.response.send_message("\n".join(linhas) + (f"\n\nJá existentes: {', '.join(existentes)}" if existentes else ""), ephemeral=True)
 
 
-@liga_group.command(name="partida", description="Agenda um confronto específico com data e horário próprios.")
+@liga_group.command(name="partida", description="Agenda uma única partida com qualquer dia e horário.")
 @app_commands.describe(casa="Time da casa", fora="Time visitante", dia="Data no formato DD/MM/AAAA", horario="Horário no formato HH:MM (BRT)", canal="Canal onde publicar")
 async def liga_partida(
     interaction: discord.Interaction,
@@ -2377,7 +2402,7 @@ async def liga_partida(
     await interaction.response.send_message(f"✅ **{casa_real} × {fora_real}** agendado para **{dia} às {horario} (BRT)** em {destino.mention}.", ephemeral=True)
 
 
-@liga_group.command(name="sortear_agora", description="Sorteia os confrontos imediatamente.")
+@liga_group.command(name="sortear_agora", description="Sorteia os confrontos imediatamente, um por mensagem.")
 @app_commands.describe(canal="Canal onde publicar")
 async def liga_sortear_agora(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
     if not await checar_permissao(interaction, "liga"):
@@ -2387,9 +2412,28 @@ async def liga_sortear_agora(interaction: discord.Interaction, canal: Optional[d
         await interaction.response.send_message("❌ Cadastre pelo menos 2 times primeiro.", ephemeral=True)
         return
     destino = canal or interaction.channel
-    evento = {"dia": datetime.datetime.now(BRT).strftime("%d/%m/%Y"), "horario": datetime.datetime.now(BRT).strftime("%H:%M"), "canal_id": destino.id, "times": times}
-    await publicar_sorteio_liga(evento)
-    await interaction.response.send_message("✅ Confrontos sorteados e publicados.", ephemeral=True)
+    assinatura = f"{destino.id}|{','.join(sorted(times))}"
+    if comando_duplicado(interaction, "liga_sortear_agora", assinatura):
+        await interaction.response.send_message("ℹ️ Esse sorteio já foi executado agora há pouco; não enviei partidas duplicadas.", ephemeral=True)
+        return
+
+    random.shuffle(times)
+    pares = []
+    while len(times) >= 2:
+        pares.append((times.pop(0), times.pop(0)))
+    agora_brt = datetime.datetime.now(BRT)
+    for casa, fora in pares:
+        await publicar_sorteio_liga({
+            "dia": agora_brt.strftime("%d/%m/%Y"),
+            "horario": agora_brt.strftime("%H:%M"),
+            "canal_id": destino.id,
+            "casa": casa,
+            "fora": fora,
+            "times": [casa, fora],
+        })
+    if times:
+        await destino.send(f"🟡 **{times[0]}** ficou de folga nesta rodada.")
+    await interaction.response.send_message(f"✅ {len(pares)} confronto(s) sorteado(s) e publicado(s) separadamente.", ephemeral=True)
 
 
 @liga_group.command(name="agenda", description="Mostra os sorteios agendados.")
