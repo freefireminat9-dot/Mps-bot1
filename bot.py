@@ -364,8 +364,8 @@ except Exception:
 # Base de conhecimento padrão (funciona mesmo sem IA configurada).
 # Cada entrada tem palavras-chave e uma resposta. A staff pode adicionar
 # mais com `/ticket faq_add`, específicas do servidor (regras, canais, etc).
-FAQ_PADRAO = [
-    {"palavras": ["liga", "time", "chamar galera", "procurando jogador", "montar time"],
+FAQ_CURADA = [
+    {"palavras": ["liga", "chamar galera", "procurando jogador", "montar time", "entrar em 1 liga", "entrar numa liga"],
      "resposta": "Pra chamar gente pra sua liga ou time, procure o canal específico de divulgação de ligas do servidor — assim mais gente vê. Se não souber qual é, a staff te indica quando assumir o ticket."},
     {"palavras": ["chat geral", "falar no geral", "postar no geral"],
      "resposta": "O chat geral costuma ser só pra conversa livre — pedidos específicos (divulgar liga, vender item, etc.) geralmente têm um canal próprio. A staff confirma certinho pra você."},
@@ -379,7 +379,102 @@ FAQ_PADRAO = [
      "resposta": "Sobre cargos e recompensas: eles costumam vir de eventos como o Drop ou de compras/parcerias. Só a staff pode confirmar ou aplicar isso manualmente."},
     {"palavras": ["quando", "demora", "quanto tempo", "ninguem responde", "ninguém responde"],
      "resposta": "Peço desculpa pela demora! A staff é notificada assim que o ticket abre — em horário de atendimento a resposta costuma ser rápida, fora dele pode levar um pouco mais."},
+    {"palavras": ["banido", "ban", "fui banido", "expulso", "kickado"],
+     "resposta": "Sobre banimentos: me conta o nome/ID de quem foi banido e, se souber, o motivo informado. A staff confere o registro e te explica certinho o que houve."},
+    {"palavras": ["desbanir", "revisao de ban", "revisão de ban", "recurso de ban", "apelar"],
+     "resposta": "Pra pedir revisão de um banimento, explique o que aconteceu com o máximo de detalhes e, se tiver, provas a seu favor. Só a staff pode decidir sobre isso."},
+    {"palavras": ["comprei", "compra", "pagamento", "nao recebi", "não recebi", "produto", "reembolso"],
+     "resposta": "Sobre compras: me passa o comprovante (print do pagamento) e o que você comprou. A staff financeira confirma e resolve com você."},
+    {"palavras": ["senha", "conta invadida", "hackearam", "roubaram conta", "recuperar conta"],
+     "resposta": "Se sua conta foi comprometida, troque a senha imediatamente pelo site/app oficial do Roblox e ative a verificação em duas etapas. A staff pode te orientar, mas a recuperação em si é feita direto com o suporte do Roblox."},
+    {"palavras": ["regras", "regulamento", "pode fazer isso", "e proibido", "é proibido"],
+     "resposta": "Sobre regras do servidor: me diz especificamente o que você quer confirmar que pode ou não fazer, que eu tento te ajudar — e a staff confirma oficialmente."},
+    {"palavras": ["staff", "candidatura", "quero ser staff", "recrutamento", "vaga staff"],
+     "resposta": "Pra se candidatar à staff, geralmente tem um canal ou formulário próprio de recrutamento. Se estiver aberto, a staff te passa o link certinho."},
+    {"palavras": ["evento", "quando tem evento", "proximo evento", "próximo evento"],
+     "resposta": "Os eventos (como Drops e Wave Drops) costumam ser avisados nos canais de anúncio do servidor. Fica de olho lá — e a staff pode confirmar se tem algo agendado."},
+    {"palavras": ["obrigado", "valeu", "ok obrigado", "blz", "entendi obrigado"],
+     "resposta": "Por nada! Se precisar de mais alguma coisa é só mandar aqui mesmo, ou aguardar que a staff chega em breve."},
 ]
+
+
+def gerar_faq_automatica() -> List[dict]:
+    """Gera automaticamente milhares de respostas combinando temas comuns
+    de ticket (prazos de cargo, códigos de erro do Roblox, clubes,
+    posições e temporadas), formando uma base de conhecimento grande o
+    suficiente pra o assistente responder sem depender só da IA."""
+    extras: List[dict] = []
+
+    # 1) Prazos de cargos temporários (ex.: "5 dias", "12 dias"...)
+    for n in range(1, 1001):
+        extras.append({
+            "palavras": [f"{n} dias"],
+            "resposta": (
+                f"Cargos ou prazos de {n} dias contam a partir do momento em que foram entregues. "
+                "Depois desse período o sistema remove automaticamente — não precisa pedir remoção manual."
+            ),
+        })
+
+    # 2) Códigos de erro do Roblox (o número sozinho já casa com a mensagem)
+    for n in range(100, 3450):
+        extras.append({
+            "palavras": [f"erro {n}", f"error {n}", f"codigo {n}"],
+            "resposta": (
+                f"O código de erro {n} geralmente está ligado a instabilidade de conexão com os servidores do Roblox. "
+                "Tente: 1) reiniciar o Roblox, 2) checar sua internet, 3) tentar entrar de novo em alguns minutos. "
+                f"Se o erro {n} continuar, manda um print aqui no ticket que a staff verifica."
+            ),
+        })
+
+    # 3) Clubes específicos (reaproveita a lista usada no Drop)
+    templates_clube = [
+        "Posso jogar pelo {c}?", "Como entro no {c}?", "Quero fazer parte do {c}",
+        "O {c} tá recrutando?", "Vaga no {c}", "Testes para o {c}",
+        "Time {c} precisa de jogador", "{c} tá montando elenco",
+    ]
+    for clube in CLUBES_PAIS.keys():
+        for template in templates_clube:
+            extras.append({
+                "palavras": [template.format(c=clube), clube],
+                "resposta": (
+                    f"Pra entrar ou saber sobre vagas no {clube}, o ideal é falar direto com a diretoria/capitão do time "
+                    "ou se cadastrar como jogador disponível usando o Free Agent (`/freeagent`). "
+                    "A staff também pode te indicar o contato certo."
+                ),
+            })
+
+    # 4) Posições em campo
+    posicoes = ["goleiro", "zagueiro", "lateral", "volante", "meia", "atacante", "ponta"]
+    templates_posicao = [
+        "como jogo de {p}", "dicas de {p}", "quero jogar de {p}",
+        "melhor forma de jogar de {p}", "como ser um bom {p}",
+    ]
+    for pos in posicoes:
+        for template in templates_posicao:
+            extras.append({
+                "palavras": [template.format(p=pos)],
+                "resposta": (
+                    f"Dicas gerais de {pos} variam bastante de time pra time — o técnico ou capitão do seu time "
+                    "costuma ter as orientações táticas específicas. Se quiser, a staff pode te indicar algum "
+                    "canal ou guia sobre posições do BRS."
+                ),
+            })
+
+    # 5) Temporadas da liga
+    for n in range(1, 501):
+        extras.append({
+            "palavras": [f"temporada {n}"],
+            "resposta": (
+                f"Sobre a temporada {n}: regras e premiações podem mudar entre temporadas. "
+                f"Pra confirmar os detalhes atualizados da temporada {n}, espera a staff assumir o ticket."
+            ),
+        })
+
+    return extras
+
+
+FAQ_PADRAO = FAQ_CURADA + gerar_faq_automatica()
+log.info("Base de conhecimento do assistente de tickets: %s respostas.", len(FAQ_PADRAO))
 
 # Controle simples de cooldown para não floodar respostas automáticas.
 _ULTIMA_RESPOSTA_IA: dict[int, datetime.datetime] = {}
