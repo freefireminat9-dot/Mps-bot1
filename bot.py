@@ -30,6 +30,8 @@ import unicodedata
 import random
 import asyncio
 import re
+import fcntl
+import hashlib
 from zoneinfo import ZoneInfo
 from typing import Optional, Union, List
 
@@ -856,7 +858,6 @@ async def on_message(message: discord.Message):
         ):
             asyncio.create_task(assistente_responder_ticket(message, ticket_info))
 
-    await bot.process_commands(message)
 
 
 # ============================================================
@@ -1146,6 +1147,8 @@ class TicketActionsView(discord.ui.View):
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        # O menu fica na mensagem principal do ticket, como na referência visual.
+        self.add_item(TicketActionsSelect())
 
     @discord.ui.button(label="Fechar Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id="brs_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1242,14 +1245,6 @@ class TicketControlView(discord.ui.View):
             embed.set_thumbnail(url=avatar)
         embed.set_footer(text="BRS — Ticket System")
         await interaction.channel.send(embed=embed)
-
-    @discord.ui.button(label="Painéis e ações do ticket", emoji="☰", style=discord.ButtonStyle.secondary, custom_id="brs_ticket_actions")
-    async def ticket_actions(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_ticket_channel(interaction.channel):
-            await interaction.response.send_message("❌ Este botão só funciona dentro de um canal de ticket.", ephemeral=True)
-            return
-        await interaction.response.send_message("Painéis e ações do ticket", view=TicketActionsView(), ephemeral=True)
-
 
 ticket_group = app_commands.Group(name="ticket", description="Sistema de tickets da BRS")
 
@@ -2110,21 +2105,46 @@ def _parse_data_hora_brt(dia: str, horario: str) -> Optional[datetime.datetime]:
         return None
 
 
+def _parse_agenda_liga(agenda: Optional[str]) -> list[tuple[str, str, datetime.datetime]]:
+    """Lê horários separados por ;, no formato DD/MM/AAAA HH:MM."""
+    if not agenda:
+        return []
+    itens = []
+    for parte in agenda.split(";"):
+        parte = parte.strip()
+        if not parte:
+            continue
+        encontrado = re.fullmatch(r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2})", parte)
+        if not encontrado:
+            return []
+        dia, horario = encontrado.groups()
+        quando = _parse_data_hora_brt(dia, horario)
+        if not quando:
+            return []
+        itens.append((dia, horario, quando))
+    return itens
+
+
 async def publicar_sorteio_liga(evento: dict):
     guild = bot.get_guild(GUILD_ID)
     canal = guild.get_channel(evento.get("canal_id")) if guild else None
     if not canal:
         return False
-    times = list(evento.get("times", []))
-    random.shuffle(times)
-    confrontos = []
-    while len(times) >= 2:
-        a, b = times.pop(0), times.pop(0)
-        confrontos.append(f"⚽ **{a}**  ×  **{b}**")
-    if times:
-        confrontos.append(f"🟡 **{times[0]}** — folga nesta rodada")
+    if evento.get("casa") and evento.get("fora"):
+        confrontos = [f"⚽ **{evento['casa']}**  ×  **{evento['fora']}**"]
+        titulo = "⚽ PARTIDA AGENDADA — BRS"
+    else:
+        times = list(evento.get("times", []))
+        random.shuffle(times)
+        confrontos = []
+        while len(times) >= 2:
+            a, b = times.pop(0), times.pop(0)
+            confrontos.append(f"⚽ **{a}**  ×  **{b}**")
+        if times:
+            confrontos.append(f"🟡 **{times[0]}** — folga nesta rodada")
+        titulo = "🎲 SORTEIO DE CONFRONTOS — BRS"
     embed = discord.Embed(
-        title="🎲 SORTEIO DE CONFRONTOS — BRS",
+        title=titulo,
         description="\n".join(confrontos) or "Nenhum confronto gerado.",
         color=BRS_GREEN,
         timestamp=agora_utc(),
@@ -2228,33 +2248,118 @@ async def liga_lista(interaction: discord.Interaction):
     await interaction.response.send_message("📋 **Times cadastrados:**\n" + ("\n".join(f"{i}. {t}" for i, t in enumerate(times, 1)) if times else "Nenhum."), ephemeral=True)
 
 
-@liga_group.command(name="sortear", description="Agenda o sorteio dos confrontos para dia e horário escolhidos.")
-@app_commands.describe(dia="Data no formato DD/MM/AAAA", horario="Horário no formato HH:MM (BRT)", canal="Canal onde publicar")
-async def liga_sortear(interaction: discord.Interaction, dia: str, horario: str, canal: Optional[discord.TextChannel] = None):
+@liga_group.command(name="sortear", description="Sorteia e agenda cada confronto separadamente.")
+@app_commands.describe(
+    dia="Data inicial no formato DD/MM/AAAA",
+    horario="Horário inicial no formato HH:MM (BRT)",
+    agenda="Opcional: um horário completo por confronto, separado por ;. Ex: 27/08/2026 20:00;28/08/2026 20:00",
+    canal="Canal onde publicar",
+)
+async def liga_sortear(
+    interaction: discord.Interaction,
+    dia: str,
+    horario: str,
+    agenda: Optional[str] = None,
+    canal: Optional[discord.TextChannel] = None,
+):
     if not await checar_permissao(interaction, "liga"):
         return
     times = list(_times_liga())
     if len(times) < 2:
         await interaction.response.send_message("❌ Cadastre pelo menos 2 times em `/liga times` antes de sortear.", ephemeral=True)
         return
-    quando = _parse_data_hora_brt(dia, horario)
-    if not quando:
-        await interaction.response.send_message("❌ Data/horário inválidos. Use `26/08/2026` e `20:30`.", ephemeral=True)
+    inicio = _parse_data_hora_brt(dia, horario)
+    if not inicio:
+        await interaction.response.send_message("❌ Data/horário inválidos. Use `27/08/2026` e `20:00`.", ephemeral=True)
         return
-    if quando <= datetime.datetime.now(BRT):
-        await interaction.response.send_message("❌ Escolha uma data e horário futuros.", ephemeral=True)
+    random.shuffle(times)
+    pares = []
+    while len(times) >= 2:
+        pares.append((times.pop(0), times.pop(0)))
+    folga = times[0] if times else None
+    horarios = _parse_agenda_liga(agenda)
+    if agenda and len(horarios) != len(pares):
+        await interaction.response.send_message(f"❌ Informe exatamente {len(pares)} horários na `agenda`, separados por `;`, um para cada confronto.", ephemeral=True)
+        return
+    if not agenda:
+        horarios = []
+        for indice in range(len(pares)):
+            quando = inicio + datetime.timedelta(days=indice)
+            horarios.append((quando.strftime("%d/%m/%Y"), quando.strftime("%H:%M"), quando))
+    if any(quando <= datetime.datetime.now(BRT) for _, _, quando in horarios):
+        await interaction.response.send_message("❌ Todos os horários dos confrontos precisam ser futuros.", ephemeral=True)
+        return
+
+    destino = canal or interaction.channel
+    lote_base = "|".join([
+        str(destino.id), dia.strip(), horario.strip(), agenda or "", ",".join(sorted(times)),
+    ])
+    lote_id = hashlib.sha256(lote_base.encode("utf-8")).hexdigest()[:24]
+    if any(e.get("status") == "agendado" and e.get("lote_id") == lote_id for e in DADOS["liga"].get("sorteios", [])):
+        await interaction.response.send_message("ℹ️ Esse sorteio já foi criado. Não dupliquei os confrontos.", ephemeral=True)
+        return
+    criados = []
+    existentes = []
+    for (casa, fora), (dia_partida, hora_partida, quando) in zip(pares, horarios):
+        duplicado = any(
+            e.get("status") == "agendado"
+            and e.get("casa") == casa
+            and e.get("fora") == fora
+            and e.get("canal_id") == destino.id
+            and e.get("executar_em") == quando.isoformat()
+            for e in DADOS["liga"].get("sorteios", [])
+        )
+        if duplicado:
+            existentes.append(f"{casa} × {fora}")
+            continue
+        criados.append({
+            "id": str(int(agora_utc().timestamp() * 1000)) + str(len(criados)),
+            "dia": dia_partida,
+            "horario": hora_partida,
+            "executar_em": quando.isoformat(),
+            "canal_id": destino.id,
+            "casa": casa,
+            "fora": fora,
+            "times": [casa, fora],
+            "status": "agendado",
+            "lote_id": lote_id,
+        })
+    DADOS["liga"]["sorteios"].extend(criados)
+    if criados:
+        salvar_dados(DADOS)
+    linhas = [f"✅ **{e['casa']} × {e['fora']}** — {e['dia']} às {e['horario']}" for e in criados]
+    if not linhas:
+        linhas = ["ℹ️ Nenhum novo confronto foi criado; os agendamentos já existiam."]
+    if folga:
+        linhas.append(f"🟡 **{folga}** ficou de folga nesta rodada.")
+    await interaction.response.send_message("\n".join(linhas) + (f"\n\nJá existentes: {', '.join(existentes)}" if existentes else ""), ephemeral=True)
+
+
+@liga_group.command(name="partida", description="Agenda um confronto específico com data e horário próprios.")
+@app_commands.describe(casa="Time da casa", fora="Time visitante", dia="Data no formato DD/MM/AAAA", horario="Horário no formato HH:MM (BRT)", canal="Canal onde publicar")
+async def liga_partida(
+    interaction: discord.Interaction,
+    casa: str,
+    fora: str,
+    dia: str,
+    horario: str,
+    canal: Optional[discord.TextChannel] = None,
+):
+    if not await checar_permissao(interaction, "liga"):
+        return
+    nomes = {normalizar(t): t for t in _times_liga()}
+    casa_real, fora_real = nomes.get(normalizar(casa)), nomes.get(normalizar(fora))
+    if not casa_real or not fora_real or casa_real == fora_real:
+        await interaction.response.send_message("❌ Informe dois times diferentes cadastrados em `/liga lista`.", ephemeral=True)
+        return
+    quando = _parse_data_hora_brt(dia, horario)
+    if not quando or quando <= datetime.datetime.now(BRT):
+        await interaction.response.send_message("❌ Data/horário inválidos ou já passados. Use, por exemplo, `27/08/2026` e `20:00`.", ephemeral=True)
         return
     destino = canal or interaction.channel
-    duplicado = any(
-        e.get("status") == "agendado"
-        and e.get("canal_id") == destino.id
-        and e.get("dia") == dia.strip()
-        and e.get("horario") == horario.strip()
-        and sorted(e.get("times", [])) == sorted(times)
-        for e in DADOS["liga"].get("sorteios", [])
-    )
+    duplicado = any(e.get("status") == "agendado" and e.get("casa") == casa_real and e.get("fora") == fora_real and e.get("executar_em") == quando.isoformat() for e in DADOS["liga"].get("sorteios", []))
     if duplicado:
-        await interaction.response.send_message("ℹ️ Já existe um sorteio igual agendado para esse canal, data e horário.", ephemeral=True)
+        await interaction.response.send_message("ℹ️ Essa partida já está agendada para esse horário.", ephemeral=True)
         return
     evento = {
         "id": str(int(agora_utc().timestamp() * 1000)),
@@ -2262,12 +2367,14 @@ async def liga_sortear(interaction: discord.Interaction, dia: str, horario: str,
         "horario": horario,
         "executar_em": quando.isoformat(),
         "canal_id": destino.id,
-        "times": times,
+        "casa": casa_real,
+        "fora": fora_real,
+        "times": [casa_real, fora_real],
         "status": "agendado",
     }
     DADOS["liga"]["sorteios"].append(evento)
     salvar_dados(DADOS)
-    await interaction.response.send_message(f"✅ Sorteio agendado para **{dia} às {horario} (BRT)** em {destino.mention}, com **{len(times)} times**.", ephemeral=True)
+    await interaction.response.send_message(f"✅ **{casa_real} × {fora_real}** agendado para **{dia} às {horario} (BRT)** em {destino.mention}.", ephemeral=True)
 
 
 @liga_group.command(name="sortear_agora", description="Sorteia os confrontos imediatamente.")
@@ -2588,4 +2695,11 @@ if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_TOKEN")
     if not TOKEN:
         raise SystemExit("❌ Defina DISCORD_TOKEN no .env ou variável de ambiente.")
+    # Impede dois processos locais com o mesmo token, causa comum de mensagens duplicadas.
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".brs_bot.lock")
+    lock_file = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("❌ Já existe outra instância do BRS rodando nesta pasta. Feche-a antes de iniciar novamente.")
     bot.run(TOKEN)
