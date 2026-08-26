@@ -2470,38 +2470,109 @@ async def liga_partida(
     await interaction.response.send_message(f"✅ **{casa_real} × {fora_real}** agendado para **{dia} às {horario} (BRT)** em {destino.mention}.", ephemeral=True)
 
 
-@liga_group.command(name="sortear_agora", description="Sorteia os confrontos imediatamente, um por mensagem.")
-@app_commands.describe(canal="Canal onde publicar")
-async def liga_sortear_agora(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
+@liga_group.command(name="sortear_agora", description="Sorteia agora e agenda cada confronto separadamente.")
+@app_commands.describe(
+    dia="Data do primeiro confronto no formato DD/MM/AAAA",
+    horario="Horário do primeiro confronto no formato HH:MM (BRT)",
+    agenda="Opcional: um horário completo por confronto separado por ;",
+    intervalo_dias="Dias entre confrontos quando agenda não for informada",
+    intervalo_minutos="Minutos adicionais entre confrontos quando agenda não for informada",
+    canal="Canal onde publicar cada partida",
+)
+async def liga_sortear_agora(
+    interaction: discord.Interaction,
+    dia: str,
+    horario: str,
+    agenda: Optional[str] = None,
+    intervalo_dias: int = 1,
+    intervalo_minutos: int = 60,
+    canal: Optional[discord.TextChannel] = None,
+):
     if not await checar_permissao(interaction, "liga"):
         return
     times = list(_times_liga())
     if len(times) < 2:
         await interaction.response.send_message("❌ Cadastre pelo menos 2 times primeiro.", ephemeral=True)
         return
+    if intervalo_dias < 0 or intervalo_minutos < 0 or (intervalo_dias == 0 and intervalo_minutos == 0):
+        await interaction.response.send_message("❌ O intervalo precisa ser positivo: use pelo menos 1 dia ou 1 minuto.", ephemeral=True)
+        return
+    inicio = _parse_data_hora_brt(dia, horario)
+    if not inicio:
+        await interaction.response.send_message("❌ Data/horário inválidos. Use `27/08/2026` e `20:00`.", ephemeral=True)
+        return
     destino = canal or interaction.channel
-    assinatura = f"{destino.id}|{','.join(sorted(times))}"
+    assinatura = f"{dia.strip()}|{horario.strip()}|{agenda or ''}|{intervalo_dias}|{intervalo_minutos}|{destino.id}|{','.join(sorted(times))}"
     if comando_duplicado(interaction, "liga_sortear_agora", assinatura):
-        await interaction.response.send_message("ℹ️ Esse sorteio já foi executado agora há pouco; não enviei partidas duplicadas.", ephemeral=True)
+        await interaction.response.send_message("ℹ️ Esse `sortear_agora` já foi recebido há poucos segundos; não dupliquei as partidas.", ephemeral=True)
         return
 
     random.shuffle(times)
     pares = []
     while len(times) >= 2:
         pares.append((times.pop(0), times.pop(0)))
-    agora_brt = datetime.datetime.now(BRT)
-    for casa, fora in pares:
-        await publicar_sorteio_liga({
-            "dia": agora_brt.strftime("%d/%m/%Y"),
-            "horario": agora_brt.strftime("%H:%M"),
+    folga = times[0] if times else None
+    horarios = _parse_agenda_liga(agenda)
+    if agenda and len(horarios) != len(pares):
+        await interaction.response.send_message(f"❌ Informe exatamente {len(pares)} horários na agenda, um para cada confronto, separados por `;`.", ephemeral=True)
+        return
+    if not agenda:
+        horarios = []
+        for indice in range(len(pares)):
+            quando = inicio + datetime.timedelta(days=indice * intervalo_dias, minutes=indice * intervalo_minutos)
+            horarios.append((quando.strftime("%d/%m/%Y"), quando.strftime("%H:%M"), quando))
+    if any(quando <= datetime.datetime.now(BRT) for _, _, quando in horarios):
+        await interaction.response.send_message("❌ Todos os horários precisam ser futuros. Escolha uma data e hora à frente do momento atual.", ephemeral=True)
+        return
+
+    times_cadastrados = list(_times_liga())
+    lote_base = "|".join([
+        "sortear_agora", str(destino.id), dia.strip(), horario.strip(), agenda or "",
+        str(intervalo_dias), str(intervalo_minutos), ",".join(sorted(times_cadastrados)),
+    ])
+    lote_id = hashlib.sha256(lote_base.encode("utf-8")).hexdigest()[:24]
+    if any(e.get("status") == "agendado" and e.get("lote_id") == lote_id for e in DADOS["liga"].get("sorteios", [])):
+        await interaction.response.send_message("ℹ️ Esse sorteio já foi criado. Não dupliquei as partidas.", ephemeral=True)
+        return
+
+    criados = []
+    existentes = []
+    for (casa, fora), (dia_partida, hora_partida, quando) in zip(pares, horarios):
+        if any(
+            e.get("status") == "agendado"
+            and e.get("casa") == casa
+            and e.get("fora") == fora
+            and e.get("canal_id") == destino.id
+            and e.get("executar_em") == quando.isoformat()
+            for e in DADOS["liga"].get("sorteios", [])
+        ):
+            existentes.append(f"{casa} × {fora}")
+            continue
+        criados.append({
+            "id": str(int(agora_utc().timestamp() * 1000)) + str(len(criados)),
+            "dia": dia_partida,
+            "horario": hora_partida,
+            "executar_em": quando.isoformat(),
             "canal_id": destino.id,
             "casa": casa,
             "fora": fora,
             "times": [casa, fora],
+            "status": "agendado",
+            "lote_id": lote_id,
+            "origem": "sortear_agora",
         })
-    if times:
-        await destino.send(f"🟡 **{times[0]}** ficou de folga nesta rodada.")
-    await interaction.response.send_message(f"✅ {len(pares)} confronto(s) sorteado(s) e publicado(s) separadamente.", ephemeral=True)
+    if criados:
+        DADOS["liga"]["sorteios"].extend(criados)
+        salvar_dados(DADOS)
+    linhas = [f"✅ **{e['casa']} × {e['fora']}** — {e['dia']} às {e['horario']} (BRT)" for e in criados]
+    if not linhas:
+        linhas = ["ℹ️ Nenhuma nova partida foi criada; os agendamentos já existiam."]
+    if folga:
+        linhas.append(f"🟡 **{folga}** ficou de folga nesta rodada.")
+    texto = "\n".join(linhas)
+    if existentes:
+        texto += f"\n\nJá existentes: {', '.join(existentes)}"
+    await interaction.response.send_message(texto, ephemeral=True)
 
 
 @liga_group.command(name="agenda", description="Mostra os sorteios agendados.")
