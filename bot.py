@@ -1,6 +1,6 @@
 """
 Bot Discord completo — BRS (Brazilian Roblox Soccer)
-Comandos: somente slash (/), sem prefixo de texto
+Prefixos: ,  e  /
 Slash: /
 
 Recursos:
@@ -266,8 +266,7 @@ DEFAULT_CONFIG = {
         "log_channel_id": None,
         "painel_titulo": "🎫 Central de Atendimento — BRS",
         "painel_descricao": "Selecione abaixo o tipo de atendimento que você precisa. Nossa staff irá te ajudar o mais rápido possível!",
-        "banner_url": "",
-        "horario_atendimento": "Sábado e domingo das 13h às 21h (BRT). Fora desse horário, o Assistente BRS (IA) continuará atendendo até a staff chegar.",
+        "faq": [],  # lista de {"palavras": [...], "resposta": "..."} — ensinado via /ticket faq_add
     },
     "drop": {
         "reward_role_ids": list(DROP_REWARD_ROLES.keys()),
@@ -351,8 +350,9 @@ def bot_avatar_url() -> Optional[str]:
 #  membro da staff clique em "Assumir". Se a variável de ambiente
 #  ANTHROPIC_API_KEY estiver configurada e o pacote `anthropic`
 #  instalado, as respostas usam IA de verdade (Claude). Caso
-#  contrário, cai em respostas prontas por categoria — o sistema
-#  nunca fica sem responder.
+#  contrário, o assistente usa uma base de perguntas frequentes
+#  (configurável por comando) para tentar entender e responder de
+#  verdade o que o membro precisa — nunca é só uma frase genérica.
 # ============================================================
 try:
     import anthropic
@@ -361,23 +361,53 @@ except Exception:
     anthropic = None
     _anthropic_client = None
 
-RESPOSTAS_PADRAO_POR_TIPO = {
-    "suporte": "Oi! Sou o Assistente BRS (IA). Recebi sua solicitação e vou organizar as informações para a staff. Enquanto isso, explique o que aconteceu e envie prints se tiver.",
-    "denuncia": "Entendi. Sou o Assistente BRS (IA); envie o nome do envolvido, o que aconteceu e as provas, como prints, vídeos ou links. A staff fará a análise oficial.",
-    "duvidas": "Pode perguntar! Sou o Assistente BRS (IA) e vou te orientar no que for possível. Se for necessária uma decisão oficial, a staff assumirá o atendimento.",
-    "parcerias": "Obrigado pelo interesse na BRS! Sou o Assistente BRS (IA); envie sua proposta com detalhes e a equipe responsável continuará o atendimento.",
-}
+# Base de conhecimento padrão (funciona mesmo sem IA configurada).
+# Cada entrada tem palavras-chave e uma resposta. A staff pode adicionar
+# mais com `/ticket faq_add`, específicas do servidor (regras, canais, etc).
+FAQ_PADRAO = [
+    {"palavras": ["liga", "time", "chamar galera", "procurando jogador", "montar time"],
+     "resposta": "Pra chamar gente pra sua liga ou time, procure o canal específico de divulgação de ligas do servidor — assim mais gente vê. Se não souber qual é, a staff te indica quando assumir o ticket."},
+    {"palavras": ["chat geral", "falar no geral", "postar no geral"],
+     "resposta": "O chat geral costuma ser só pra conversa livre — pedidos específicos (divulgar liga, vender item, etc.) geralmente têm um canal próprio. A staff confirma certinho pra você."},
+    {"palavras": ["bug", "travando", "erro", "nao consigo entrar", "não consigo entrar", "crashou"],
+     "resposta": "Entendi, parece ser um problema técnico. Me conta: em qual tela/ação isso acontece e se aparece alguma mensagem de erro? Isso ajuda a staff a resolver mais rápido."},
+    {"palavras": ["denunciar", "denuncia", "hacker", "cheater", "xingou", "ofendeu", "provas", "print"],
+     "resposta": "Pra denúncia, o mais importante são provas: prints, vídeos ou links da conversa/situação. Pode mandar aqui mesmo no ticket que a staff analisa."},
+    {"palavras": ["parceria", "divulgação", "divulgar servidor", "afiliação", "proposta"],
+     "resposta": "Legal que você quer fazer parceria! Me conta rapidinho: qual é a proposta (tipo de parceria, o que oferece e o que espera em troca)? Assim a equipe de negócios já pega o contexto pronto."},
+    {"palavras": ["cargo", "role", "vip", "premio", "prêmio", "recompensa"],
+     "resposta": "Sobre cargos e recompensas: eles costumam vir de eventos como o Drop ou de compras/parcerias. Só a staff pode confirmar ou aplicar isso manualmente."},
+    {"palavras": ["quando", "demora", "quanto tempo", "ninguem responde", "ninguém responde"],
+     "resposta": "Peço desculpa pela demora! A staff é notificada assim que o ticket abre — em horário de atendimento a resposta costuma ser rápida, fora dele pode levar um pouco mais."},
+]
 
 # Controle simples de cooldown para não floodar respostas automáticas.
 _ULTIMA_RESPOSTA_IA: dict[int, datetime.datetime] = {}
-_HISTORICO_IA: dict[int, list[dict[str, str]]] = {}
-COOLDOWN_IA_SEGUNDOS = 5
+COOLDOWN_IA_SEGUNDOS = 8
 
 
-async def gerar_resposta_ia(pergunta: str, tipo_ticket: str, historico: Optional[list[dict[str, str]]] = None) -> Optional[str]:
+def buscar_resposta_faq(pergunta_normalizada: str, tipo_ticket: str) -> Optional[str]:
+    """Procura, na base de conhecimento (padrão + configurada pela staff),
+    a resposta cuja(s) palavra(s)-chave melhor combinam com a mensagem.
+    Retorna None se nada bateu o suficiente."""
+    faq_custom = DADOS["config"]["ticket"].get("faq", [])
+    candidatos = faq_custom + FAQ_PADRAO  # o que a staff ensinou tem prioridade
+
+    melhor_resposta = None
+    melhor_pontuacao = 0
+    for entrada in candidatos:
+        pontuacao = sum(1 for p in entrada.get("palavras", []) if normalizar(p) in pergunta_normalizada)
+        if pontuacao > melhor_pontuacao:
+            melhor_pontuacao = pontuacao
+            melhor_resposta = entrada.get("resposta")
+
+    return melhor_resposta if melhor_pontuacao > 0 else None
+
+
+async def gerar_resposta_ia(pergunta: str, tipo_ticket: str) -> Optional[str]:
     """Tenta gerar uma resposta real com IA (Claude). Retorna None se a
     integração não estiver configurada ou der erro — quem chamar deve
-    usar a resposta padrão da categoria nesse caso."""
+    cair para a base de conhecimento (FAQ) nesse caso."""
     if not _anthropic_client:
         return None
     tipo = TICKET_CATEGORIES_BY_KEY.get(tipo_ticket, {"label": "Atendimento"})
@@ -387,19 +417,19 @@ async def gerar_resposta_ia(pergunta: str, tipo_ticket: str, historico: Optional
             model="claude-haiku-4-5-20251001",
             max_tokens=250,
             system=(
-                "Você é o assistente virtual da staff da BRS (Brazilian Roblox "
-                "Soccer), uma comunidade de Discord sobre futebol no Roblox. "
-                f"O ticket atual é da categoria '{tipo['label']}'. Fale como um "
-                "atendente de primeiro nível: leia a pergunta inteira, responda diretamente "
-                "e explique o motivo de forma simples. Se faltar contexto, faça uma pergunta "
-                "de continuação. Peça informações ou provas somente quando forem necessárias. "
-                "Responda em português do Brasil, como uma conversa natural entre atendente "
-                "e usuário, com até 6 frases e sem repetir a mesma saudação em toda mensagem. Seja "
-                "transparente: você é o Assistente BRS (IA), não uma pessoa real, "
-                "e a staff assumirá quando necessário. Nunca prometa cargos, "
-                "recompensas ou decisões que só a staff pode tomar."
+                "Você é o assistente automático de tickets da BRS (Brazilian Roblox "
+                "Soccer), uma comunidade de Discord sobre um jogo de futebol no "
+                f"Roblox. O ticket atual é da categoria '{tipo['label']}'. Sua "
+                "missão é entender exatamente o que a pessoa quer e tentar ajudar "
+                "de verdade com isso — se faltar informação, faça UMA pergunta "
+                "objetiva para entender melhor. Responda de forma curta (no "
+                "máximo 3-4 frases), simpática e em português do Brasil. Deixe "
+                "claro, de forma natural, que você é um assistente automático e "
+                "que um membro da staff de verdade vai assumir o atendimento em "
+                "breve. Nunca prometa recompensas, cargos ou ações que só a "
+                "staff pode fazer."
             ),
-            messages=(historico or [{"role": "user", "content": pergunta[:1500]}])[-8:],
+            messages=[{"role": "user", "content": pergunta[:1500]}],
         )
         blocos = [b.text for b in resposta.content if getattr(b, "type", None) == "text"]
         return "\n".join(blocos).strip()
@@ -414,7 +444,18 @@ async def gerar_resposta_ia(pergunta: str, tipo_ticket: str, historico: Optional
 
 
 async def assistente_responder_ticket(message: discord.Message, ticket_info: dict):
-    """Responde como o Assistente BRS (IA) até a staff clicar em Assumir."""
+    """Faz o assistente automático tentar entender e responder de verdade
+    a mensagem de quem abriu o ticket, enquanto ninguém da staff assumiu.
+
+    Ordem de prioridade:
+      1) IA (Claude), se ANTHROPIC_API_KEY estiver configurada — entende
+         qualquer mensagem em linguagem natural.
+      2) Base de conhecimento (FAQ padrão + ensinada pela staff via
+         `/ticket faq_add`) — casa por palavras-chave.
+      3) Resposta contextual, citando o que a pessoa escreveu e pedindo
+         mais detalhes — nunca uma frase 100% genérica sem relação com
+         a pergunta.
+    """
     agora = datetime.datetime.utcnow()
     ultima = _ULTIMA_RESPOSTA_IA.get(message.channel.id)
     if ultima and (agora - ultima).total_seconds() < COOLDOWN_IA_SEGUNDOS:
@@ -422,39 +463,33 @@ async def assistente_responder_ticket(message: discord.Message, ticket_info: dic
     _ULTIMA_RESPOSTA_IA[message.channel.id] = agora
 
     tipo_key = ticket_info.get("tipo", "suporte")
-    pergunta = message.content.strip()
-    if message.attachments:
-        anexos = ", ".join(anexo.filename for anexo in message.attachments[:5])
-        pergunta = f"{pergunta or 'O usuário enviou anexos.'} Anexos recebidos: {anexos}."
-    pergunta = pergunta or "O usuário enviou uma mensagem sem texto. Peça que ele explique a solicitação."
-
-    historico = _HISTORICO_IA.setdefault(message.channel.id, [])
-    historico.append({"role": "user", "content": pergunta[:1500]})
-    del historico[:-8]
+    pergunta_normalizada = normalizar(message.content)
 
     async with message.channel.typing():
-        texto_ia = await gerar_resposta_ia(pergunta, tipo_key, historico)
-        texto = texto_ia or RESPOSTAS_PADRAO_POR_TIPO.get(
-            tipo_key, RESPOSTAS_PADRAO_POR_TIPO["suporte"]
-        )
-    historico.append({"role": "assistant", "content": texto[:1500]})
-    del historico[:-8]
-
-    # Se a staff assumiu durante a geração, não envie uma resposta atrasada.
-    estado_atual = DADOS["tickets"].get(str(message.channel.id))
-    if not estado_atual or estado_atual.get("reivindicado"):
-        return
+        texto = await gerar_resposta_ia(message.content, tipo_key)
+        if not texto:
+            texto = buscar_resposta_faq(pergunta_normalizada, tipo_key)
+        if not texto:
+            # Não achou nada específico — ainda assim responde de forma
+            # contextual, mostrando que leu a mensagem, e pede detalhes.
+            resumo = message.content.strip()
+            if len(resumo) > 120:
+                resumo = resumo[:117] + "..."
+            texto = (
+                f"Entendi que você disse: \"{resumo}\". Ainda não tenho uma resposta pronta pra isso, "
+                "mas já registrei aqui — pode me dar mais detalhes enquanto isso? "
+                "Assim que a staff assumir, vai ter todo o contexto pra te ajudar direito."
+            )
 
     embed = discord.Embed(
         title="🤖 Assistente BRS (IA)",
-        description=f"{message.author.mention}\n\n{texto}",
+        description=f"Oi {message.author.mention}! {texto}",
         color=BRS_GREEN,
     )
     avatar = bot_avatar_url()
     if avatar:
-        embed.set_author(name="Assistente BRS • Atendimento", icon_url=avatar)
         embed.set_thumbnail(url=avatar)
-    embed.set_footer(text="✦ Atendimento automático · Um membro da staff assumirá quando necessário.")
+    embed.set_footer(text="✦ Atendimento automático · Um membro da staff chegará em breve.")
     await message.channel.send(embed=embed)
 
 
@@ -464,7 +499,7 @@ async def assistente_responder_ticket(message: discord.Message, ticket_info: dic
 class BRSBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix=commands.when_mentioned,
+            command_prefix=commands.when_mentioned_or(",", "/"),
             intents=intents,
             help_command=None,
         )
@@ -472,20 +507,20 @@ class BRSBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
+        self.tree.add_command(ticket_group, guild=GUILD)
+        self.tree.add_command(drop_group, guild=GUILD)
+        self.tree.add_command(freeagent_group, guild=GUILD)
+        self.tree.add_command(scouting_group, guild=GUILD)
 
-        # Cada grupo é adicionado apenas se ainda não estiver na árvore local.
-        # Isso evita CommandAlreadyRegistered e a sensação de precisar mandar
-        # o comando duas vezes quando o processo é reiniciado/reconectado.
-        for grupo in (ticket_group, drop_group, freeagent_group, scouting_group):
-            if self.tree.get_command(grupo.name, guild=GUILD) is None:
-                self.tree.add_command(grupo, guild=GUILD)
+        # Remove qualquer comando GLOBAL registrado em execuções antigas.
+        # É a causa mais comum de um comando aparecer duplicado no Discord:
+        # um comando global e um da guild com o mesmo nome coexistindo.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()  # sincroniza o global vazio, apagando duplicatas antigas
 
-        if not getattr(self, "_brs_commands_synced", False):
-            synced = await self.tree.sync(guild=GUILD)
-            self._brs_commands_synced = True
-            log.info("Sincronizados %s comandos na guild %s", len(synced), GUILD_ID)
-        if not verificar_expiracoes.is_running():
-            verificar_expiracoes.start()
+        synced = await self.tree.sync(guild=GUILD)
+        log.info("Sincronizados %s comandos na guild %s", len(synced), GUILD_ID)
+        verificar_expiracoes.start()
 
 
 bot = BRSBot()
@@ -614,181 +649,109 @@ def usuario_tem_ticket_aberto(guild: discord.Guild, user: discord.Member) -> Opt
 class TicketTypeSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(
-                label=c["label"],
-                value=c["key"],
-                emoji=c["emoji"],
-                description=c["descricao"][:100],
-            )
+            discord.SelectOption(label=c["label"], value=c["key"], emoji=c["emoji"], description=c["descricao"][:100])
             for c in TICKET_CATEGORIES
         ]
         super().__init__(
             placeholder="Selecione o tipo de atendimento...",
-            min_values=1,
-            max_values=1,
-            options=options,
+            min_values=1, max_values=1, options=options,
             custom_id="brs_ticket_select",
         )
 
     async def callback(self, interaction: discord.Interaction):
-        existente = usuario_tem_ticket_aberto(interaction.guild, interaction.user)
+        guild = interaction.guild
+        cfg = DADOS["config"]["ticket"]
+        tipo_key = self.values[0]
+        tipo = TICKET_CATEGORIES_BY_KEY.get(tipo_key, TICKET_CATEGORIES[0])
+
+        existente = usuario_tem_ticket_aberto(guild, interaction.user)
         if existente:
-            await interaction.response.send_message(
-                f"❌ Você já possui um ticket aberto: {existente.mention}",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(f"❌ Você já possui um ticket aberto: {existente.mention}", ephemeral=True)
             return
-        await interaction.response.send_modal(TicketReasonModal(self.values[0]))
 
-
-class TicketReasonModal(discord.ui.Modal, title="Detalhes do atendimento"):
-    duvida = discord.ui.TextInput(
-        label="Explique sua dúvida ou solicitação",
-        placeholder="Conte o que aconteceu e inclua os detalhes importantes...",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        min_length=3,
-        max_length=1800,
-    )
-
-    def __init__(self, tipo_key: str):
-        super().__init__()
-        self.tipo_key = tipo_key
-
-    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await criar_ticket(interaction, self.tipo_key, self.duvida.value.strip())
 
-
-async def criar_ticket(interaction: discord.Interaction, tipo_key: str, duvida: str):
-    guild = interaction.guild
-    cfg = DADOS["config"]["ticket"]
-    tipo = TICKET_CATEGORIES_BY_KEY.get(tipo_key, TICKET_CATEGORIES[0])
-
-    # Verifica novamente para evitar dois tickets se o usuário clicar duas vezes.
-    existente = usuario_tem_ticket_aberto(guild, interaction.user)
-    if existente:
-        await interaction.followup.send(
-            f"❌ Você já possui um ticket aberto: {existente.mention}",
-            ephemeral=True,
+        template = cfg.get("channel_name_template") or "ticket-{tipo}-{user}"
+        nome_canal = (
+            template.replace("{tipo}", tipo_key)
+            .replace("{user}", interaction.user.name)
+            .lower().replace(" ", "-")[:90]
         )
-        return
+        if not nome_canal.startswith("ticket-"):
+            nome_canal = f"ticket-{nome_canal}"[:90]
 
-    template = cfg.get("channel_name_template") or "ticket-{tipo}-{user}"
-    nome_canal = (
-        template.replace("{tipo}", tipo_key)
-        .replace("{user}", interaction.user.name)
-        .lower()
-        .replace(" ", "-")[:90]
-    )
-    if not nome_canal.startswith("ticket-"):
-        nome_canal = f"ticket-{nome_canal}"[:90]
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        for rid in cfg.get("staff_role_ids", []):
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, manage_channels=True
-        ),
-    }
-    for rid in cfg.get("staff_role_ids", []):
-        role = guild.get_role(rid)
-        if role:
-            overwrites[role] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True
-            )
+        category = guild.get_channel(cfg.get("category_id")) if cfg.get("category_id") else None
+        ticket_channel = await guild.create_text_channel(
+            name=nome_canal, category=category, overwrites=overwrites,
+            topic=f"Ticket de {tipo['label']} | user_id:{interaction.user.id}",
+            reason=f"Ticket ({tipo['label']}) aberto por {interaction.user}",
+        )
 
-    category = guild.get_channel(cfg.get("category_id")) if cfg.get("category_id") else None
-    ticket_channel = await guild.create_text_channel(
-        name=nome_canal,
-        category=category,
-        overwrites=overwrites,
-        topic=f"Ticket de {tipo['label']} | user_id:{interaction.user.id}",
-        reason=f"Ticket ({tipo['label']}) aberto por {interaction.user}",
-    )
+        mensagem = (cfg.get("welcome_message") or "Olá {mention}!").replace(
+            "{mention}", interaction.user.mention
+        ).replace("{user}", interaction.user.display_name)
 
-    mensagem = (cfg.get("welcome_message") or "Olá {mention}!").replace(
-        "{mention}", interaction.user.mention
-    ).replace("{user}", interaction.user.display_name)
-    horario = cfg.get(
-        "horario_atendimento",
-        "Sábado e domingo das 13h às 21h (BRT). Fora desse horário, o Assistente BRS (IA) continuará atendendo até a staff chegar.",
-    )
+        embed = discord.Embed(
+            title=f"{tipo['emoji']} Ticket — {tipo['label']}",
+            description=f"{mensagem}\n\n**Categoria:** {tipo['descricao']}",
+            color=BRS_GREEN,
+            timestamp=datetime.datetime.now(),
+        )
+        avatar = bot_avatar_url()
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+        embed.set_footer(text=f"Aberto por {interaction.user}", icon_url=interaction.user.display_avatar.url)
 
-    embed = discord.Embed(
-        title="🎫 Ticket Aberto",
-        description=mensagem,
-        color=EMBED_COLOR,
-        timestamp=datetime.datetime.now(),
-    )
-    embed.add_field(
-        name="📋 Informações do Ticket",
-        value=(
-            f"**Nome do Ticket:** `{ticket_channel.name}`\n"
-            f"**Criado por:** {interaction.user.mention}\n"
-            f"**Tipo do Ticket:** {tipo['emoji']} **{tipo['label']}**"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="📝 Informações Preenchidas",
-        value=f"**Dúvida:** {duvida[:900]}",
-        inline=False,
-    )
-    embed.add_field(
-        name="📎 Envie provas, prints ou links diretamente no ticket.",
-        value="Use o menu **Painéis e ações do ticket** para registrar links e informações importantes.",
-        inline=False,
-    )
-    embed.add_field(name="⏰ Horário de atendimento", value=horario[:1024], inline=False)
-    banner_url = cfg.get("banner_url")
-    if banner_url:
-        embed.set_image(url=banner_url)
-    avatar = bot_avatar_url()
-    if avatar:
-        embed.set_thumbnail(url=avatar)
-    embed.set_footer(text="BRS — Ticket System")
+        staff_pings = " ".join(
+            f"<@&{rid}>" for rid in cfg.get("staff_role_ids", []) if guild.get_role(rid)
+        )
+        conteudo = f"{interaction.user.mention} {staff_pings}".strip()
 
-    staff_pings = " ".join(
-        f"<@&{rid}>" for rid in cfg.get("staff_role_ids", []) if guild.get_role(rid)
-    )
-    conteudo = f"{interaction.user.mention} {staff_pings}".strip()
-    await ticket_channel.send(content=conteudo, embed=embed, view=TicketControlView())
+        await ticket_channel.send(content=conteudo, embed=embed, view=TicketControlView())
 
-    DADOS["tickets"][str(ticket_channel.id)] = {
-        "autor_id": interaction.user.id,
-        "tipo": tipo_key,
-        "duvida": duvida,
-        "reivindicado": False,
-        "reivindicado_por": None,
-    }
-    salvar_dados(DADOS)
+        # Guarda o estado do ticket (autor, tipo e se já foi reivindicado)
+        # para o assistente automático e para os botões de controle usarem.
+        DADOS["tickets"][str(ticket_channel.id)] = {
+            "autor_id": interaction.user.id,
+            "tipo": tipo_key,
+            "reivindicado": False,
+            "reivindicado_por": None,
+        }
+        salvar_dados(DADOS)
 
-    assistente_embed = discord.Embed(
-        title="🤖 Assistente BRS (IA)",
-        description=(
-            f"Oi {interaction.user.mention}! Pode perguntar, tô aqui pra ajudar "
-            "enquanto a staff não chega. Vou explicar sua dúvida e pedir mais detalhes "
-            "se for necessário."
-        ),
-        color=BRS_GREEN,
-    )
-    if avatar:
-        assistente_embed.set_author(name="Assistente BRS • Atendimento", icon_url=avatar)
-        assistente_embed.set_thumbnail(url=avatar)
-    assistente_embed.set_footer(text="✦ Atendimento automático · A staff assumirá quando necessário.")
-    await ticket_channel.send(embed=assistente_embed)
+        # Mensagem do assistente automático, avisando que vai ajudar
+        # enquanto a staff não chega — igual ao "Assistente (IA)" de referência.
+        assistente_embed = discord.Embed(
+            title="🤖 Assistente BRS (IA)",
+            description=(
+                f"Oi {interaction.user.mention}! Pode perguntar, tô aqui pra ajudar "
+                "enquanto a staff não chega."
+            ),
+            color=BRS_GREEN,
+        )
+        if avatar:
+            assistente_embed.set_thumbnail(url=avatar)
+        assistente_embed.set_footer(text="✦ Atendimento automático · Um membro da staff chegará em breve.")
+        await ticket_channel.send(embed=assistente_embed)
 
-    log_id = cfg.get("log_channel_id")
-    if log_id and (log_channel := guild.get_channel(log_id)):
-        await log_channel.send(embed=discord.Embed(
-            description=f"🎫 Ticket aberto: {ticket_channel.mention} ({tipo['label']}) por {interaction.user.mention}",
-            color=discord.Color.green(),
-        ))
+        log_id = cfg.get("log_channel_id")
+        if log_id and (log_channel := guild.get_channel(log_id)):
+            await log_channel.send(embed=discord.Embed(
+                description=f"🎫 Ticket aberto: {ticket_channel.mention} ({tipo['label']}) por {interaction.user.mention}",
+                color=discord.Color.green(),
+            ))
 
-    await interaction.followup.send(f"✅ Ticket criado: {ticket_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"✅ Ticket criado: {ticket_channel.mention}", ephemeral=True)
 
 
 class TicketPanelView(discord.ui.View):
@@ -797,118 +760,11 @@ class TicketPanelView(discord.ui.View):
         self.add_item(TicketTypeSelect())
 
 
-class EnviarProvasModal(discord.ui.Modal, title="Enviar provas ao ticket"):
-    provas = discord.ui.TextInput(
-        label="Links ou descrição das provas",
-        placeholder="Cole links de prints/vídeos ou explique quais arquivos você vai enviar...",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1800,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title="📎 Provas enviadas",
-            description=f"**Enviado por:** {interaction.user.mention}\n\n{self.provas.value}",
-            color=BRS_GREEN,
-            timestamp=datetime.datetime.now(),
-        )
-        avatar = bot_avatar_url()
-        if avatar:
-            embed.set_thumbnail(url=avatar)
-        embed.set_footer(text="BRS — Evidências do ticket")
-        await interaction.channel.send(embed=embed)
-        await interaction.response.send_message(
-            "✅ Suas provas foram registradas no ticket. Se precisar, envie os arquivos como anexo em uma mensagem logo abaixo.",
-            ephemeral=True,
-        )
-
-
-class TicketActionsSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(
-                label="Painel Staff",
-                value="staff",
-                emoji="🛠️",
-                description="Ver informações e ações da equipe",
-            ),
-            discord.SelectOption(
-                label="Painel Membro",
-                value="membro",
-                emoji="👤",
-                description="Ver orientações para quem abriu o ticket",
-            ),
-            discord.SelectOption(
-                label="Enviar Provas",
-                value="provas",
-                emoji="📎",
-                description="Enviar links, prints ou vídeos ao ticket",
-            ),
-        ]
-        super().__init__(
-            placeholder="Escolha uma ação do ticket...",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="brs_ticket_actions_select",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        escolha = self.values[0]
-        ticket_info = DADOS["tickets"].get(str(interaction.channel.id), {})
-        tipo = TICKET_CATEGORIES_BY_KEY.get(ticket_info.get("tipo", "suporte"), TICKET_CATEGORIES[0])
-        avatar = bot_avatar_url()
-
-        if escolha == "staff":
-            if not tem_permissao(interaction.user, "ticket"):
-                await interaction.response.send_message(
-                    "❌ O Painel Staff é exclusivo da equipe de atendimento.", ephemeral=True
-                )
-                return
-            autor = interaction.guild.get_member(ticket_info.get("autor_id")) if interaction.guild else None
-            status = "✅ Já assumido" if ticket_info.get("reivindicado") else "🟡 Aguardando staff"
-            embed = discord.Embed(
-                title="🛠️ Painel Staff",
-                description=(
-                    f"**Solicitante:** {autor.mention if autor else 'não encontrado'}\n"
-                    f"**Categoria:** {tipo['label']}\n"
-                    f"**Status:** {status}\n\n"
-                    "Use **Assumir** para iniciar o atendimento oficial."
-                ),
-                color=BRS_GREEN,
-            )
-        elif escolha == "membro":
-            embed = discord.Embed(
-                title="👤 Painel Membro",
-                description=(
-                    f"Este é o seu ticket de **{tipo['label']}**.\n\n"
-                    "Explique a situação com detalhes, envie prints ou links pelo menu **Enviar Provas** "
-                    "e aguarde a staff. O Assistente BRS (IA) pode orientar enquanto ninguém assumir."
-                ),
-                color=BRS_GREEN,
-            )
-        else:
-            await interaction.response.send_modal(EnviarProvasModal())
-            return
-
-        if avatar:
-            embed.set_thumbnail(url=avatar)
-        embed.set_footer(text="BRS — Ticket System")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class TicketActionsView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.add_item(TicketActionsSelect())
-
-
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Reivindicar Ticket", emoji="📋", style=discord.ButtonStyle.green, custom_id="brs_claim_ticket")
+    @discord.ui.button(label="Assumir", emoji="🙋", style=discord.ButtonStyle.blurple, custom_id="brs_claim_ticket")
     async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_ticket_channel(interaction.channel):
             await interaction.response.send_message("❌ Este botão só funciona dentro de um canal de ticket.", ephemeral=True)
@@ -927,7 +783,6 @@ class TicketControlView(discord.ui.View):
             if (guild := interaction.guild) and (autor := guild.get_member(ticket_info.get("autor_id"))):
                 autor_mention = autor.mention
         _ULTIMA_RESPOSTA_IA.pop(interaction.channel.id, None)
-        _HISTORICO_IA.pop(interaction.channel.id, None)
 
         button.label = f"Assumido por {interaction.user.display_name}"
         button.disabled = True
@@ -944,17 +799,6 @@ class TicketControlView(discord.ui.View):
         )
         embed.set_footer(text="BRS — Ticket System")
         await interaction.channel.send(embed=embed)
-
-    @discord.ui.button(label="Painéis e ações do ticket", emoji="☰", style=discord.ButtonStyle.secondary, custom_id="brs_ticket_actions")
-    async def ticket_actions(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_ticket_channel(interaction.channel):
-            await interaction.response.send_message("❌ Este botão só funciona dentro de um canal de ticket.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "Escolha uma opção para continuar:",
-            view=TicketActionsView(),
-            ephemeral=True,
-        )
 
     @discord.ui.button(label="Fechar Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id="brs_close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -989,7 +833,6 @@ class TicketControlView(discord.ui.View):
         await canal.send(f"🔒 Ticket fechado por {interaction.user.mention}. Encerrando em 5 segundos...")
         DADOS["tickets"].pop(str(canal.id), None)
         _ULTIMA_RESPOSTA_IA.pop(canal.id, None)
-        _HISTORICO_IA.pop(canal.id, None)
         salvar_dados(DADOS)
         await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=5))
         await canal.delete(reason=f"Ticket fechado por {interaction.user}")
@@ -1005,8 +848,6 @@ ticket_group = app_commands.Group(name="ticket", description="Sistema de tickets
     nome_canal="Modelo do nome (use {tipo} e {user})",
     mensagem="Mensagem inicial (use {mention})",
     canal_logs="Canal de logs (recebe abertura, fechamento e transcript)",
-    banner="URL opcional da imagem grande no topo do ticket",
-    horario="Horário de atendimento exibido no ticket",
 )
 async def ticket_configurar(
     interaction: discord.Interaction,
@@ -1015,8 +856,6 @@ async def ticket_configurar(
     nome_canal: Optional[str] = None,
     mensagem: Optional[str] = None,
     canal_logs: Optional[discord.TextChannel] = None,
-    banner: Optional[str] = None,
-    horario: Optional[str] = None,
 ):
     if not await checar_permissao(interaction, "ticket"):
         return
@@ -1038,12 +877,6 @@ async def ticket_configurar(
     if canal_logs:
         cfg["log_channel_id"] = canal_logs.id
         alterado.append(f"📜 Logs: {canal_logs.mention}")
-    if banner is not None:
-        cfg["banner_url"] = banner.strip()
-        alterado.append("🖼️ Banner do ticket atualizado")
-    if horario:
-        cfg["horario_atendimento"] = horario
-        alterado.append("⏰ Horário de atendimento atualizado")
     salvar_dados(DADOS)
     if not alterado:
         await interaction.response.send_message("ℹ️ Nenhuma alteração enviada.", ephemeral=True)
@@ -1093,6 +926,54 @@ async def ticket_remove(interaction: discord.Interaction, alvo: Union[discord.Me
     await interaction.channel.set_permissions(alvo, overwrite=None)
     await interaction.response.send_message(f"✅ {alvo.mention} removido(a).", ephemeral=True)
     await interaction.channel.send(f"➖ {alvo.mention} removido(a) por {interaction.user.mention}.")
+
+
+@ticket_group.command(name="faq_add", description="Ensina o assistente automático a responder algo específico.")
+@app_commands.describe(
+    palavras_chave="Palavras separadas por vírgula que ativam essa resposta (ex: liga,time,jogador)",
+    resposta="O que o assistente deve responder quando detectar essas palavras",
+)
+async def ticket_faq_add(interaction: discord.Interaction, palavras_chave: str, resposta: str):
+    if not await checar_permissao(interaction, "ticket"):
+        return
+    palavras = [p.strip() for p in palavras_chave.split(",") if p.strip()]
+    if not palavras:
+        await interaction.response.send_message("❌ Informe ao menos uma palavra-chave.", ephemeral=True)
+        return
+    DADOS["config"]["ticket"].setdefault("faq", []).append({"palavras": palavras, "resposta": resposta})
+    salvar_dados(DADOS)
+    await interaction.response.send_message(
+        f"✅ Aprendido! Quando alguém mencionar `{', '.join(palavras)}`, o assistente vai responder:\n> {resposta}",
+        ephemeral=True,
+    )
+
+
+@ticket_group.command(name="faq_lista", description="Lista as respostas ensinadas ao assistente automático.")
+async def ticket_faq_lista(interaction: discord.Interaction):
+    if not await checar_permissao(interaction, "ticket"):
+        return
+    faq = DADOS["config"]["ticket"].get("faq", [])
+    if not faq:
+        await interaction.response.send_message("ℹ️ Nenhuma resposta customizada ensinada ainda. Use `/ticket faq_add`.", ephemeral=True)
+        return
+    linhas = [f"**{i}.** `{', '.join(f['palavras'])}` → {f['resposta']}" for i, f in enumerate(faq)]
+    embed = discord.Embed(title="🧠 Base de Conhecimento do Assistente", description="\n\n".join(linhas), color=BRS_GREEN)
+    embed.set_footer(text="Use /ticket faq_remover <número> para apagar uma entrada.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@ticket_group.command(name="faq_remover", description="Remove uma resposta ensinada ao assistente (veja o número em /ticket faq_lista).")
+@app_commands.describe(numero="Número da entrada mostrado em /ticket faq_lista")
+async def ticket_faq_remover(interaction: discord.Interaction, numero: int):
+    if not await checar_permissao(interaction, "ticket"):
+        return
+    faq = DADOS["config"]["ticket"].get("faq", [])
+    if not (0 <= numero < len(faq)):
+        await interaction.response.send_message("❌ Número inválido. Veja `/ticket faq_lista`.", ephemeral=True)
+        return
+    removida = faq.pop(numero)
+    salvar_dados(DADOS)
+    await interaction.response.send_message(f"✅ Removida: `{', '.join(removida['palavras'])}`", ephemeral=True)
 
 
 # ============================================================
